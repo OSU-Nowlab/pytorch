@@ -329,8 +329,11 @@ cmake_dependent_option(USE_MKLDNN_CBLAS "Use CBLAS in MKLDNN" OFF "USE_MKLDNN"
 option(USE_STATIC_MKL "Prefer to link with MKL statically (Unix only)" OFF)
 option(USE_DISTRIBUTED "Use distributed" ON)
 cmake_dependent_option(
-  USE_MPI "Use MPI for Caffe2. Only available if USE_DISTRIBUTED is on." ON
-  "USE_DISTRIBUTED" OFF)
+    USE_MPI "Use MPI for Caffe2. Only available if USE_DISTRIBUTED is on." ON
+    "USE_DISTRIBUTED" OFF)
+cmake_dependent_option(
+    USE_CUDA_MPI "Force CUDA-Aware MPI for Caffe2. Only available if USE_DISTRIBUTED and USE_MPI is on." OFF
+    "USE_DISTRIBUTED AND USE_MPI" OFF)
 cmake_dependent_option(
   USE_UCC "Use UCC. Only available if USE_DISTRIBUTED is on." OFF
   "USE_DISTRIBUTED" OFF)
