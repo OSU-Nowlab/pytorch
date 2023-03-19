@@ -30,6 +30,7 @@ class MPIDataTypeWrapper;
 MPI_DATATYPE_WRAPPER(char, MPI_CHAR)
 MPI_DATATYPE_WRAPPER(float, MPI_FLOAT)
 MPI_DATATYPE_WRAPPER(double, MPI_DOUBLE)
+MPI_DATATYPE_WRAPPER(half, MPIX_C_FLOAT16)
 // Note(Yangqing): as necessary, add more specializations.
 #undef MPI_DATATYPE_WRAPPER
 
