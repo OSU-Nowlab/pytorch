@@ -37,8 +37,8 @@ namespace caffe2 {
 #else // !OPEN_MPI
 // We have not really tested against other MPI environments, so let's go for a
 // safe path and basically say we don't have cuda-aware functions.
-#define CAFFE2_HAS_CUDA_MPI_BASICS 0
-#define CAFFE2_HAS_CUDA_MPI_ALLREDUCE 0
+#define CAFFE2_HAS_CUDA_MPI_BASICS 1
+#define CAFFE2_HAS_CUDA_MPI_ALLREDUCE 1
 #endif // OPEN_MPI
 
 // We allow a macro to force using fallback functions.

@@ -2124,7 +2124,10 @@ class FullyShardedDataParallel(nn.Module):
             tensor = torch.empty(
                 chunk_size * self.world_size, dtype=local_tensor.dtype
             ).cuda()
-            dist._all_gather_base(tensor, local_tensor, group=self.process_group)
+            #dist._all_gather_base(tensor, local_tensor, group=self.process_group)
+            output_tensors = list(torch.chunk(tensor, dist.get_world_size(group=self.process_group)))
+            dist.all_gather(output_tensors, local_tensor, group=self.process_group)
+            tensor=torch.cat(output_tensors)
             tensor = tensor.narrow(0, 0, param_numel).reshape(param.size())
             nonsharded_tensors.append(tensor)
 
@@ -2792,9 +2795,11 @@ class FullyShardedDataParallel(nn.Module):
                 num_pad = self.world_size * chunks[0].numel() - grad.numel()
                 input_flattened = F.pad(grad_flatten, [0, num_pad])
                 output = torch.zeros_like(chunks[0])
-                dist._reduce_scatter_base(
-                    output, input_flattened, group=self.process_group
-                )
+                #dist._reduce_scatter_base(
+                #    output, input_flattened, group=self.process_group
+                #)
+                input_tensor_lst = list(torch.chunk(input_flattened, dist.get_world_size(self.process_group)))
+                dist.reduce_scatter(output, input_tensor_lst, group=self.process_group)
                 if self.gradient_postdivide_factor > 1:
                     # Average grad by world_size for consistency with PyTorch DDP.
                     output.div_(self.gradient_postdivide_factor)
@@ -3107,10 +3112,12 @@ class FullyShardedDataParallel(nn.Module):
                         _alloc_storage(p._full_param_padded, size=p_full_size)  # type: ignore[attr-defined]
                         output_tensor = p._full_param_padded  # type: ignore[attr-defined]
                     # Fill output_tensor with (p.data for each shard in self.world_size)
-                    dist._all_gather_base(
-                        output_tensor, p_data, group=self.process_group
-                    )
-
+                    #dist._all_gather_base(
+                    #    output_tensor, p_data, group=self.process_group
+                    #)
+                    output_tensor_list = list(torch.chunk(output_tensor, dist.get_world_size(group=self.process_group)))
+                    dist.all_gather(output_tensor_list, p_data, group=self.process_group)
+                    output_tensor=torch.cat(output_tensor_list)
                     # The full parameter, which can be freed. Note that we
                     # append here before update_p_data so as to not saved the
                     # tensor with padding trimmed, which causes issues with
@@ -3221,7 +3228,10 @@ class FullyShardedDataParallel(nn.Module):
             device = self.compute_device
             indices = torch.zeros(self.world_size, dtype=torch.int32, device=device)
             index = torch.tensor([param_index], dtype=torch.int32, device=device)
-            dist._all_gather_base(indices, index, group=self.process_group)
+            #dist._all_gather_base(indices, index, group=self.process_group)
+            output_tensors = list(torch.chunk(indices, dist.get_world_size(self.process_group)))
+            dist.all_gather(output_tensors, index, group=self.process_group)
+            indices=torch.cat(output_tensors)
             # Check that all ranks plan to all-gather the same parameter index
             for (r1, i1), (r2, i2) in itertools.combinations(
                 ((rank, indices[rank]) for rank in range(self.world_size)), 2,
