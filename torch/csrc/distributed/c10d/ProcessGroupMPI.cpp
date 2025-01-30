@@ -697,7 +697,6 @@ c10::intrusive_ptr<Work> ProcessGroupMPI::reduce_scatter(
     std::vector<at::Tensor>& outputTensors,
     std::vector<std::vector<at::Tensor>>& inputTensors,
     const ReduceScatterOptions& opts) {
-  //TORCH_CHECK(false, "ProcessGroupMPI does not support reduce_scatter");
 
     std::function<void(std::unique_ptr<WorkEntry>&)> runFunc =
       [opts, this](std::unique_ptr<WorkEntry>& entry) {
@@ -727,11 +726,52 @@ c10::intrusive_ptr<Work> ProcessGroupMPI::reduce_scatter(
         &inputTensors[0], &outputTensors, std::move(runFunc));
     return enqueue(
         std::move(entry),
-        "mpi:reduce-scatter",
+        "mpi:reduce_scatter",
         inputTensors.size() > 0
-            ? c10::optional<std::vector<at::Tensor>>(inputTensors[0])
-            : c10::nullopt);
+            ? std::optional<std::vector<at::Tensor>>(inputTensors[0])
+            : std::nullopt);
 }
+
+c10::intrusive_ptr<Work> ProcessGroupMPI::_reduce_scatter_base(
+    at::Tensor& outputTensor,
+    at::Tensor& inputTensor,
+    const ReduceScatterOptions& opts) {
+
+    checkSingleTensorHelper(inputTensor);
+    checkSingleTensorHelper(outputTensor);
+
+    std::function<void(std::unique_ptr<WorkEntry>&)> runFunc =
+      [opts, this, &inputTensor](std::unique_ptr<WorkEntry>& entry) {
+        auto data = (entry->dst)[0];
+        void* sendbuf = nullptr;
+
+        // Input tensor is already flat, so directly use it
+        sendbuf = (entry->src)[0].data_ptr();
+        int recvcounts[size_];
+        std::fill_n(recvcounts, size_, inputTensor.numel() / (size_));
+        c10::DeviceGuard guard(data.device());
+        std::unique_lock<std::mutex> globalLock(pgGlobalMutex_);
+
+        MPI_CHECK(MPI_Reduce_scatter(
+            sendbuf,
+            data.data_ptr(),
+            recvcounts,
+            mpiDatatype.at(inputTensor.scalar_type()),
+            mpiOp.at(opts.reduceOp),
+            pgComm_));
+      };
+
+    std::vector<at::Tensor> inputTensors = {inputTensor};
+    std::vector<at::Tensor> outputTensors = {outputTensor};
+    auto entry = std::make_unique<WorkEntry>(
+        &inputTensors, &outputTensors, std::move(runFunc));
+
+    return enqueue(
+        std::move(entry),
+        "mpi:_reduce_scatter_base",
+        std::optional<std::vector<at::Tensor>>(inputTensors));
+}
+
 
 c10::intrusive_ptr<Work> ProcessGroupMPI::alltoall_base(
     at::Tensor& outputTensor,
@@ -975,12 +1015,48 @@ c10::intrusive_ptr<Work> ProcessGroupMPI::barrier(const BarrierOptions& opts) {
   return enqueue(std::move(entry), "mpi:barrier", std::nullopt);
 }
 
+//c10::intrusive_ptr<Work> ProcessGroupMPI::_allgather_base(
+//    at::Tensor& /*unused */,
+//    at::Tensor& /*unused */,
+//    const AllgatherOptions& /*unused */) {
+//  TORCH_CHECK(false, "no support for _allgather_base in MPI process group");
+//}
+
 c10::intrusive_ptr<Work> ProcessGroupMPI::_allgather_base(
-    at::Tensor& /*unused */,
-    at::Tensor& /*unused */,
-    const AllgatherOptions& /*unused */) {
-  TORCH_CHECK(false, "no support for _allgather_base in MPI process group");
+    at::Tensor& outputTensor,
+    at::Tensor& inputTensor,
+    const AllgatherOptions& opts) {
+  
+  checkSingleTensorHelper(inputTensor);
+  checkSingleTensorHelper(outputTensor);
+
+  std::function<void(std::unique_ptr<WorkEntry>&)> runFunc =
+      [this](std::unique_ptr<WorkEntry>& entry) {
+        auto& src = entry->src[0];
+        auto& dst = entry->dst[0];
+
+        c10::DeviceGuard guard(src.device());
+        std::unique_lock<std::mutex> globalLock(pgGlobalMutex_);
+
+        MPI_CHECK(MPI_Allgather(
+            src.data_ptr(),
+            src.numel(),
+            mpiDatatype.at(src.scalar_type()),
+            dst.data_ptr(),
+            src.numel(),
+            mpiDatatype.at(src.scalar_type()),
+            pgComm_));
+      };
+      
+  std::vector<at::Tensor> inputTensors = {inputTensor};
+  std::vector<at::Tensor> outputTensors = {outputTensor};
+  auto entry = std::make_unique<WorkEntry>(&inputTensors, &outputTensors, std::move(runFunc));
+  return enqueue(
+      std::move(entry),
+      "mpi:allgather-base",
+      std::optional<std::vector<at::Tensor>>(inputTensors));
 }
+
 
 } // namespace c10d
 
