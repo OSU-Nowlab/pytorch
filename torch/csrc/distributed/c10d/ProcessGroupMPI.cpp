@@ -741,14 +741,15 @@ c10::intrusive_ptr<Work> ProcessGroupMPI::_reduce_scatter_base(
     checkSingleTensorHelper(outputTensor);
 
     std::function<void(std::unique_ptr<WorkEntry>&)> runFunc =
-      [opts, this, &inputTensor](std::unique_ptr<WorkEntry>& entry) {
+      [opts, this](std::unique_ptr<WorkEntry>& entry) {
         auto data = (entry->dst)[0];
         void* sendbuf = nullptr;
 
         // Input tensor is already flat, so directly use it
         sendbuf = (entry->src)[0].data_ptr();
         int recvcounts[size_];
-        std::fill_n(recvcounts, size_, inputTensor.numel() / (size_));
+        const int sendcount = entry -> src[0].numel() / (size_);
+        std::fill_n(recvcounts, size_, sendcount);
         c10::DeviceGuard guard(data.device());
         std::unique_lock<std::mutex> globalLock(pgGlobalMutex_);
 
@@ -756,7 +757,7 @@ c10::intrusive_ptr<Work> ProcessGroupMPI::_reduce_scatter_base(
             sendbuf,
             data.data_ptr(),
             recvcounts,
-            mpiDatatype.at(inputTensor.scalar_type()),
+            mpiDatatype.at(entry->src[0].scalar_type()),
             mpiOp.at(opts.reduceOp),
             pgComm_));
       };
@@ -769,7 +770,9 @@ c10::intrusive_ptr<Work> ProcessGroupMPI::_reduce_scatter_base(
     return enqueue(
         std::move(entry),
         "mpi:_reduce_scatter_base",
-        std::optional<std::vector<at::Tensor>>(inputTensors));
+        inputTensors.size() > 0
+            ? std::optional<std::vector<at::Tensor>>(inputTensors)
+            : std::nullopt);
 }
 
 
@@ -1015,13 +1018,6 @@ c10::intrusive_ptr<Work> ProcessGroupMPI::barrier(const BarrierOptions& opts) {
   return enqueue(std::move(entry), "mpi:barrier", std::nullopt);
 }
 
-//c10::intrusive_ptr<Work> ProcessGroupMPI::_allgather_base(
-//    at::Tensor& /*unused */,
-//    at::Tensor& /*unused */,
-//    const AllgatherOptions& /*unused */) {
-//  TORCH_CHECK(false, "no support for _allgather_base in MPI process group");
-//}
-
 c10::intrusive_ptr<Work> ProcessGroupMPI::_allgather_base(
     at::Tensor& outputTensor,
     at::Tensor& inputTensor,
@@ -1032,8 +1028,8 @@ c10::intrusive_ptr<Work> ProcessGroupMPI::_allgather_base(
 
   std::function<void(std::unique_ptr<WorkEntry>&)> runFunc =
       [this](std::unique_ptr<WorkEntry>& entry) {
-        auto& src = entry->src[0];
-        auto& dst = entry->dst[0];
+        auto& src = (entry->src)[0];
+        auto& dst = (entry->dst)[0];
 
         c10::DeviceGuard guard(src.device());
         std::unique_lock<std::mutex> globalLock(pgGlobalMutex_);
