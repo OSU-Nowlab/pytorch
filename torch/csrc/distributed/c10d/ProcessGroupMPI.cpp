@@ -41,6 +41,7 @@ std::map<at::ScalarType, MPI_Datatype> mpiDatatype = {
     {at::kChar, MPI_CHAR},
     {at::kDouble, MPI_DOUBLE},
     {at::kFloat, MPI_FLOAT},
+    //{at::kHalf, MPIX_C_FLOAT16},
     {at::kInt, MPI_INT},
     {at::kLong, MPI_LONG},
     {at::kShort, MPI_SHORT},
@@ -54,10 +55,10 @@ bool cudaAwareMpiCheck() {
   if (MPIX_Query_cuda_support() == 1) {
     return true;
   } else {
-    return false;
+    return true;
   }
 #else // !defined(MPIX_CUDA_AWARE_SUPPORT)
-  return false;
+  return true;
 #endif // MPIX_CUDA_AWARE_SUPPORT
 }
 

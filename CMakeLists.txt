@@ -320,6 +320,9 @@ cmake_dependent_option(
   USE_MPI "Use MPI for Caffe2. Only available if USE_DISTRIBUTED is on." ON
   "USE_DISTRIBUTED" OFF)
 cmake_dependent_option(
+    USE_CUDA_MPI "Force CUDA-Aware MPI for Caffe2. Only available if USE_DISTRIBUTED and USE_MPI is on." OFF
+    "USE_DISTRIBUTED AND USE_MPI" OFF)
+cmake_dependent_option(
   USE_UCC "Use UCC. Only available if USE_DISTRIBUTED is on." OFF
   "USE_DISTRIBUTED" OFF)
 cmake_dependent_option(USE_SYSTEM_UCC "Use system-wide UCC" OFF "USE_UCC" OFF)
@@ -1312,10 +1315,10 @@ if(BUILD_SHARED_LIBS)
     FILES ${PROJECT_SOURCE_DIR}/cmake/Modules/FindCUDSS.cmake
     DESTINATION share/cmake/Caffe2/
     COMPONENT dev)
-  install(
-    FILES ${PROJECT_SOURCE_DIR}/cmake/Modules/FindSYCLToolkit.cmake
-    DESTINATION share/cmake/Caffe2/
-    COMPONENT dev)
+#  install(
+#    FILES ${PROJECT_SOURCE_DIR}/cmake/Modules/FindSYCLToolkit.cmake
+#    DESTINATION share/cmake/Caffe2/
+#    COMPONENT dev)
   if(NOT BUILD_LIBTORCHLESS)
     install(
       EXPORT Caffe2Targets
