@@ -4,7 +4,7 @@
 
 #include <iostream>
 #include <map>
-
+#include <cuda_runtime.h> // TODO: check for CUDA awareness
 #include <c10/core/DeviceGuard.h>
 #include <c10/util/irange.h>
 #include <torch/csrc/distributed/c10d/ProcessGroup.hpp>
@@ -423,7 +423,7 @@ c10::intrusive_ptr<Work> ProcessGroupMPI::allreduce(
     std::vector<at::Tensor>& tensors,
     const AllreduceOptions& opts) {
   checkSingleTensor(tensors);
-
+  cudaDeviceSynchronize();
   std::function<void(std::unique_ptr<WorkEntry>&)> runFunc =
       [opts, this](std::unique_ptr<WorkEntry>& entry) {
         auto data = (entry->src)[0];
