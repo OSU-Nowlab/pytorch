@@ -399,6 +399,7 @@ c10::intrusive_ptr<Work> ProcessGroupMPI::broadcast(
     std::vector<at::Tensor>& tensors,
     const BroadcastOptions& opts) {
   checkSingleTensor(tensors);
+  cudaDeviceSynchronize();
   std::function<void(std::unique_ptr<WorkEntry>&)> runFunc =
       [opts, this](std::unique_ptr<WorkEntry>& entry) {
         auto data = (entry->src)[0];
@@ -455,7 +456,7 @@ c10::intrusive_ptr<Work> ProcessGroupMPI::reduce(
     std::vector<at::Tensor>& tensors,
     const ReduceOptions& opts) {
   checkSingleTensor(tensors);
-
+  cudaDeviceSynchronize();
   std::function<void(std::unique_ptr<WorkEntry>&)> runFunc =
       [opts, this](std::unique_ptr<WorkEntry>& entry) {
         auto data = (entry->src)[0];
@@ -487,6 +488,7 @@ c10::intrusive_ptr<Work> ProcessGroupMPI::allgather(
     std::vector<at::Tensor>& inputTensors,
     const AllgatherOptions& opts) {
   checkSingleTensor(inputTensors);
+  cudaDeviceSynchronize();
   if (outputTensors.size() != 1) {
     TORCH_CHECK(
         false,
@@ -543,6 +545,7 @@ c10::intrusive_ptr<Work> ProcessGroupMPI::gather(
     std::vector<at::Tensor>& inputTensors,
     const GatherOptions& opts) {
   checkSingleTensor(inputTensors);
+  cudaDeviceSynchronize();
 
   if (rank_ != opts.rootRank) {
     if (!outputTensors.empty()) {
@@ -620,6 +623,7 @@ c10::intrusive_ptr<Work> ProcessGroupMPI::scatter(
     std::vector<std::vector<at::Tensor>>& inputTensors,
     const ScatterOptions& opts) {
   checkSingleTensor(outputTensors);
+  cudaDeviceSynchronize();
 
   if (rank_ != opts.rootRank) {
     if (!inputTensors.empty()) {
@@ -707,6 +711,7 @@ c10::intrusive_ptr<Work> ProcessGroupMPI::alltoall_base(
     const AllToAllOptions& opts) {
   checkSingleTensorHelper(inputTensor);
   checkSingleTensorHelper(outputTensor);
+  cudaDeviceSynchronize();
 
   if (outputSplitSizes.empty() && inputSplitSizes.empty()) {
     // We can use alltoall
@@ -786,6 +791,7 @@ c10::intrusive_ptr<Work> ProcessGroupMPI::alltoall(
     std::vector<at::Tensor>& outputTensors,
     std::vector<at::Tensor>& inputTensors,
     const AllToAllOptions& opts) {
+  cudaDeviceSynchronize();
   TORCH_CHECK(
       inputTensors.size() == static_cast<size_t>(size_),
       "Number of input tensors are not equal to group size");
@@ -849,6 +855,7 @@ c10::intrusive_ptr<Work> ProcessGroupMPI::send(
     int dstRank,
     int tag) {
   checkSingleTensor(tensors);
+  cudaDeviceSynchronize();
 
   auto& tensor = tensors[0];
   MPI_Request request = MPI_REQUEST_NULL;
@@ -878,6 +885,7 @@ c10::intrusive_ptr<Work> ProcessGroupMPI::recv(
     int srcRank,
     int tag) {
   checkSingleTensor(tensors);
+  cudaDeviceSynchronize();
 
   auto& tensor = tensors[0];
   MPI_Request request = MPI_REQUEST_NULL;
@@ -931,6 +939,7 @@ c10::intrusive_ptr<Work> ProcessGroupMPI::recvAnysource(
 }
 
 c10::intrusive_ptr<Work> ProcessGroupMPI::barrier(const BarrierOptions& opts) {
+  cudaDeviceSynchronize();
   std::function<void(std::unique_ptr<WorkEntry>&)> runFunc =
       [this](std::unique_ptr<WorkEntry>& entry) {
         std::unique_lock<std::mutex> globalLock(pgGlobalMutex_);
