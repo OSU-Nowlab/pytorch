@@ -5,7 +5,6 @@
 #include <iostream>
 #include <map>
 #include <cuda_runtime.h> // TODO: check for CUDA awareness
-#include <cuda_runtime.h> // TODO: check for CUDA awareness
 #include <c10/core/DeviceGuard.h>
 #include <c10/util/irange.h>
 #include <torch/csrc/distributed/c10d/ProcessGroup.hpp>
@@ -57,10 +56,8 @@ bool cudaAwareMpiCheck() {
     return true;
   } else {
     return true;
-    return true;
   }
 #else // !defined(MPIX_CUDA_AWARE_SUPPORT)
-  return true;
   return true;
 #endif // MPIX_CUDA_AWARE_SUPPORT
 }
@@ -402,7 +399,6 @@ c10::intrusive_ptr<Work> ProcessGroupMPI::broadcast(
     std::vector<at::Tensor>& tensors,
     const BroadcastOptions& opts) {
   checkSingleTensor(tensors);
-  cudaDeviceSynchronize();
   cudaDeviceSynchronize();
   std::function<void(std::unique_ptr<WorkEntry>&)> runFunc =
       [opts, this](std::unique_ptr<WorkEntry>& entry) {
