@@ -9,6 +9,14 @@
 #include <c10/util/irange.h>
 #include <torch/csrc/distributed/c10d/ProcessGroup.hpp>
 
+#ifdef USE_CUDA_MPI
+#include <ATen/cuda/CUDAContext.h>
+#include <ATen/cuda/CUDAEvent.h>
+#include <c10/cuda/CUDACachingAllocator.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAStream.h>
+#endif
+
 #if defined(OPEN_MPI) && OPEN_MPI
 #include <mpi-ext.h> // Needed for CUDA-aware check
 #endif
@@ -316,6 +324,10 @@ c10::intrusive_ptr<ProcessGroupMPI> ProcessGroupMPI::createProcessGroupMPI(
   return c10::make_intrusive<ProcessGroupMPI>(rank, size, groupComm);
 }
 
+inline std::string getKeyFromDevice(at::Device& device) {
+  return std::to_string(device.index());
+}
+
 ProcessGroupMPI::ProcessGroupMPI(int rank, int size, MPI_Comm pgComm)
     : Backend(rank, size), stop_(false), pgComm_(pgComm) {
   if (pgComm_ == MPI_COMM_NULL) {
@@ -326,6 +338,18 @@ ProcessGroupMPI::ProcessGroupMPI(int rank, int size, MPI_Comm pgComm)
   workerThread_ = std::thread(&ProcessGroupMPI::runLoop, this);
 
   init();
+#ifdef USE_CUDA_MPI
+  // get a cuda stream from the stream pool
+  auto streamVal = at::cuda::getStreamFromPool();
+  // setup stream communicator
+  MPI_Info info;
+  MPI_Info_create(&info);
+  MPI_info_set(info, "type", "cudaStream_t");
+  MPIX_Info_set_hex(info, "value", &streamVal, sizeof(streamVal));
+  MPIX_Stream_create(info, &mpixStream_);
+  MPI_Info_free(&info);
+  MPIX_Stream_comm_create(MPI_COMM_WORLD, mpix_strm, &mpixStreamComm_);
+#endif
 }
 
 ProcessGroupMPI::~ProcessGroupMPI() {
@@ -345,6 +369,12 @@ void ProcessGroupMPI::destroy() {
 
   // Join the single worker thread
   workerThread_.join();
+
+#ifdef USE_CUDA_MPI
+  // free up stream communicators
+  MPI_Comm_free(mpixStreamComm_);
+  MPIX_Stream_free(mpixStream_);
+#endif
 }
 
 void ProcessGroupMPI::abort() {
@@ -424,6 +454,17 @@ c10::intrusive_ptr<Work> ProcessGroupMPI::allreduce(
     std::vector<at::Tensor>& tensors,
     const AllreduceOptions& opts) {
   checkSingleTensor(tensors);
+#ifdef USE_CUDA_MPI
+  auto data = tensors[0];
+  c10::DeviceGuard guard(data.device());
+  MPI_CHECK(MPI_Allreduce_enqueue(
+      MPI_IN_PLACE,
+      data.data_ptr(),
+      data.numel(),
+      mpiDatatype.at(data.scalar_type()),
+      mpiOp.at(opts.reduceOp),
+      mpixStreamComm_));
+#else
   cudaDeviceSynchronize();
   std::function<void(std::unique_ptr<WorkEntry>&)> runFunc =
       [opts, this](std::unique_ptr<WorkEntry>& entry) {
@@ -444,6 +485,7 @@ c10::intrusive_ptr<Work> ProcessGroupMPI::allreduce(
       std::move(entry),
       "mpi:all_reduce",
       std::optional<std::vector<at::Tensor>>(tensors));
+#endif
 }
 
 c10::intrusive_ptr<Work> ProcessGroupMPI::allreduce_coalesced(

@@ -9,6 +9,7 @@
 #include <mutex>
 #include <thread>
 #include <vector>
+#include <unordered_map>
 
 #include <ATen/core/ivalue.h>
 #include <ATen/core/ivalue_inl.h>
@@ -16,6 +17,10 @@
 #include <torch/csrc/distributed/c10d/Backend.hpp>
 #include <torch/csrc/distributed/c10d/Types.hpp>
 #include <torch/csrc/distributed/c10d/Utils.hpp>
+
+#ifdef USE_CUDA_MPI
+#include <c10/cuda/CUDAStream.h>
+#endif
 
 #include <mpi.h>
 
@@ -266,6 +271,11 @@ class TORCH_API ProcessGroupMPI : public Backend {
   static int mpiThreadSupport_;
 
   MPI_Comm pgComm_;
+// add USE_CUDA_MPI guard
+#ifdef USE_CUDA_MPI
+    MPI_Comm mpixStreamComm_;
+    MPIX_Stream mpixStream_;
+#endif
 };
 
 } // namespace c10d
