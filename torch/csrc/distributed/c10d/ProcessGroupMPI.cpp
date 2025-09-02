@@ -8,8 +8,10 @@
 #include <c10/core/DeviceGuard.h>
 #include <c10/util/irange.h>
 #include <torch/csrc/distributed/c10d/ProcessGroup.hpp>
+#include <chrono>
+#include <thread>
 
-#ifdef USE_CUDA_MPI
+#ifdef USE_MPIX_STREAM
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/cuda/CUDAEvent.h>
 #include <c10/cuda/CUDACachingAllocator.h>
@@ -232,6 +234,235 @@ void ProcessGroupMPI::AsyncWork::populateException() {
       std::make_exception_ptr(std::runtime_error(std::string(buf.data(), len)));
 }
 
+#ifdef USE_MPIX_STREAM
+ProcessGroupMPI::MPIXStreamWork::MPIXStreamWork(
+    std::vector<at::Tensor> outputTensors,
+    const char* profilingTitle,
+    const std::optional<std::vector<at::Tensor>>& inputTensors,
+    bool enableTiming)
+    : Work(-1, OpType::UNKNOWN, profilingTitle, inputTensors),
+      outputTensors_(std::move(outputTensors)),
+      device_(outputTensors_.empty() ? at::Device("cuda") : outputTensors_[0].device()),
+      future_(c10::make_intrusive<at::ivalue::Future>(
+          c10::ListType::create(c10::TensorType::get()))),
+      timingEnabled_(enableTiming) {
+  
+  try {
+    
+    TORCH_CHECK(!outputTensors_.empty(), 
+                "MPIXStreamWork requires at least one output tensor");
+    
+    
+    TORCH_CHECK(device_.is_cuda(), 
+                "MPIXStreamWork requires CUDA device, got: ", device_);
+    
+    if (timingEnabled_) {
+      startEvent_ = std::make_shared<at::cuda::CUDAEvent>(cudaEventDisableTiming);
+      TORCH_CHECK(startEvent_, "Failed to create start event for MPIXStreamWork");
+    }
+    
+    endEvent_ = std::make_shared<at::cuda::CUDAEvent>(cudaEventDisableTiming);
+    TORCH_CHECK(endEvent_, "Failed to create end event for MPIXStreamWork");
+    
+  } catch (const std::exception& e) {
+    TORCH_CHECK(false, "Failed to construct MPIXStreamWork: ", e.what());
+  }
+}
+
+ProcessGroupMPI::MPIXStreamWork::~MPIXStreamWork() = default;
+
+bool ProcessGroupMPI::MPIXStreamWork::isCompleted() {
+  try {
+    return finishedGPUExecutionInternal();
+  } catch (...) {
+    setException(std::current_exception());
+    return true;
+  }
+}
+
+bool ProcessGroupMPI::MPIXStreamWork::isSuccess() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return finishedGPUExecutionInternal() && !exception_;
+}
+
+bool ProcessGroupMPI::MPIXStreamWork::wait(std::chrono::milliseconds timeout) {
+  if (isCompleted()) {
+    synchronize();
+    return true;
+  }
+
+  try {
+    
+    if (timeout == kUnsetTimeout) {
+      
+      endEvent_->synchronize();
+    } else {
+      
+      auto start_time = std::chrono::steady_clock::now();
+      while (!finishedGPUExecutionInternal()) {
+        auto elapsed = std::chrono::steady_clock::now() - start_time;
+        if (elapsed >= timeout) {
+          TORCH_WARN("MPIXStreamWork::wait() timed out after ", 
+                     std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count(), "ms");
+          return false;
+        }
+        
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
+      }
+    }
+    
+    if (exception_) {
+      std::rethrow_exception(exception_);
+    }
+    
+    return true;
+    
+  } catch (const c10::Error& e) {
+    setException(std::current_exception());
+    throw;
+  } catch (const std::exception& e) {
+    setException(std::make_exception_ptr(
+        std::runtime_error(std::string("MPIXStreamWork::wait() failed: ") + e.what())));
+    throw;
+  } catch (...) {
+    setException(std::make_exception_ptr(
+        std::runtime_error("MPIXStreamWork::wait() failed with unknown error")));
+    throw;
+  }
+}
+
+void ProcessGroupMPI::MPIXStreamWork::abort() {
+  setException(std::make_exception_ptr(
+      std::runtime_error("WorkMPIXStream operation was aborted")));
+}
+
+void ProcessGroupMPI::MPIXStreamWork::synchronize() {
+  try {
+    
+    auto currentStream = at::cuda::getCurrentCUDAStream(device_.index());
+    
+    
+    TORCH_CHECK(device_.index() >= 0, 
+                "Invalid device index: ", device_.index());
+    
+    
+    endEvent_->block(currentStream);
+    
+    if (exception_) {
+      std::rethrow_exception(exception_);
+    }
+    
+  } catch (const c10::Error& e) {
+    setException(std::current_exception());
+    throw;
+  } catch (const std::exception& e) {
+    setException(std::make_exception_ptr(
+        std::runtime_error(std::string("MPIXStreamWork::synchronize() failed: ") + e.what())));
+    throw;
+  } catch (...) {
+    setException(std::make_exception_ptr(
+        std::runtime_error("MPIXStreamWork::synchronize() failed with unknown error")));
+    throw;
+  }
+}
+
+std::vector<at::Tensor> ProcessGroupMPI::MPIXStreamWork::result() {
+  return outputTensors_;
+}
+
+c10::intrusive_ptr<c10::ivalue::Future> ProcessGroupMPI::MPIXStreamWork::getFuture() {
+  return future_;
+}
+
+float ProcessGroupMPI::MPIXStreamWork::getDuration() const {
+  try {
+    TORCH_CHECK(timingEnabled_, "getDuration only works if timing was enabled");
+    TORCH_CHECK(
+        startEvent_,
+        "getDuration only works if startEvent_ is populated, true if timing enabled");
+    TORCH_CHECK(
+        endEvent_,
+        "getDuration only works if endEvent_ is populated, which should always be true");
+    
+    
+    if (!finishedGPUExecutionInternal()) {
+      TORCH_WARN("getDuration() called before operation completed, results may be inaccurate");
+    }
+    
+    return startEvent_->elapsed_time(*endEvent_);
+    
+  } catch (const std::exception& e) {
+    TORCH_CHECK(false, "getDuration() failed: ", e.what());
+  }
+}
+
+bool ProcessGroupMPI::MPIXStreamWork::finishedGPUExecutionInternal() const {
+  try {
+    TORCH_CHECK(endEvent_, "endEvent_ is null, cannot query completion status");
+    return endEvent_->query();
+  } catch (const std::exception& e) {
+    
+    TORCH_WARN("finishedGPUExecutionInternal() failed: ", e.what());
+    return false; // Assume not completed on error
+  }
+}
+
+void ProcessGroupMPI::MPIXStreamWork::setException(std::exception_ptr exception_ptr) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  exception_ = exception_ptr;
+  future_->setError(exception_ptr);
+}
+
+
+c10::intrusive_ptr<ProcessGroupMPI::MPIXStreamWork> ProcessGroupMPI::createMPIXWork(
+    std::vector<at::Tensor>& tensors,
+    const char* profilingTitle,
+    bool enableTiming) {
+  
+  
+  TORCH_CHECK(hasMPIXStream(), 
+              "MPIX stream not initialized. Cannot create MPIXStreamWork.");
+  
+  TORCH_CHECK(!tensors.empty(), 
+              "Cannot create MPIXStreamWork with empty tensor list.");
+  
+  TORCH_CHECK(tensors[0].is_cuda(), 
+              "MPIX stream operations require CUDA tensors, got tensor on device: ", 
+              tensors[0].device());
+  
+  
+  auto expected_device = tensors[0].device();
+  for (size_t i = 1; i < tensors.size(); ++i) {
+    TORCH_CHECK(tensors[i].device() == expected_device,
+                "All tensors must be on the same device. Expected: ", expected_device,
+                ", but tensor at index ", i, " is on: ", tensors[i].device());
+  }
+  
+  
+  for (size_t i = 0; i < tensors.size(); ++i) {
+    TORCH_CHECK(tensors[i].is_contiguous(),
+                "MPIX operations require contiguous tensors, but tensor at index ", i, 
+                " is not contiguous.");
+  }
+  
+  try {
+    auto work = c10::make_intrusive<MPIXStreamWork>(tensors, profilingTitle, std::nullopt, enableTiming);
+    
+    
+    work->cudaStream_ = getMPIXCudaStream();
+    
+    
+    if (work->startEvent_) {
+      work->startEvent_->record(getMPIXCudaStream());
+    }
+    
+    return work;
+  } catch (const std::exception& e) {
+    TORCH_CHECK(false, "Failed to create MPIXStreamWork: ", e.what());
+  }
+}
+#endif // USE_MPIX_STREAM
+
 // Static global states
 int ProcessGroupMPI::mpiThreadSupport_ = 0;
 std::mutex ProcessGroupMPI::pgGlobalMutex_;
@@ -338,17 +569,36 @@ ProcessGroupMPI::ProcessGroupMPI(int rank, int size, MPI_Comm pgComm)
   workerThread_ = std::thread(&ProcessGroupMPI::runLoop, this);
 
   init();
-#ifdef USE_CUDA_MPI
-  // get a cuda stream from the stream pool
-  auto streamVal = at::cuda::getStreamFromPool();
-  // setup stream communicator
-  MPI_Info info;
-  MPI_Info_create(&info);
-  MPI_info_set(info, "type", "cudaStream_t");
-  MPIX_Info_set_hex(info, "value", &streamVal, sizeof(streamVal));
-  MPIX_Stream_create(info, &mpixStream_);
-  MPI_Info_free(&info);
-  MPIX_Stream_comm_create(MPI_COMM_WORLD, mpix_strm, &mpixStreamComm_);
+#ifdef USE_MPIX_STREAM
+  
+  mpixStreamComm_ = MPI_COMM_NULL; // Initialize to invalid state
+  try {
+    
+    mpixCudaStream_ = at::cuda::getStreamFromPool();
+    cudaStream_t streamVal = mpixCudaStream_.stream();
+    
+    
+    MPI_Info info;
+    MPI_CHECK(MPI_Info_create(&info));
+    
+    try {
+      MPI_CHECK(MPI_Info_set(info, "type", "cudaStream_t"));
+      MPI_CHECK(MPIX_Info_set_hex(info, "value", &streamVal, sizeof(streamVal)));
+      MPI_CHECK(MPIX_Stream_create(info, &mpixStream_));
+      MPI_CHECK(MPIX_Stream_comm_create(MPI_COMM_WORLD, mpixStream_, &mpixStreamComm_));
+    } catch (...) {
+      MPI_Info_free(&info);
+      throw;
+    }
+    
+    MPI_CHECK(MPI_Info_free(&info));
+    
+  } catch (const std::exception& e) {
+    
+    TORCH_WARN("Failed to initialize MPIX stream support: ", e.what(), 
+               ". Falling back to traditional MPI operations.");
+    mpixStreamComm_ = MPI_COMM_NULL;
+  }
 #endif
 }
 
@@ -370,10 +620,17 @@ void ProcessGroupMPI::destroy() {
   // Join the single worker thread
   workerThread_.join();
 
-#ifdef USE_CUDA_MPI
-  // free up stream communicators
-  MPI_Comm_free(mpixStreamComm_);
-  MPIX_Stream_free(mpixStream_);
+#ifdef USE_MPIX_STREAM
+  // Clean up MPIX stream resources (NCCL-style with error checking)
+  if (hasMPIXStream()) {
+    try {
+      MPI_CHECK(MPI_Comm_free(&mpixStreamComm_));
+      MPI_CHECK(MPIX_Stream_free(&mpixStream_));
+    } catch (const std::exception& e) {
+      // Log error but don't throw in destructor
+      TORCH_WARN("Error during MPIX stream cleanup: ", e.what());
+    }
+  }
 #endif
 }
 
@@ -454,17 +711,73 @@ c10::intrusive_ptr<Work> ProcessGroupMPI::allreduce(
     std::vector<at::Tensor>& tensors,
     const AllreduceOptions& opts) {
   checkSingleTensor(tensors);
-#ifdef USE_CUDA_MPI
-  auto data = tensors[0];
-  c10::DeviceGuard guard(data.device());
-  MPI_CHECK(MPI_Allreduce_enqueue(
-      MPI_IN_PLACE,
-      data.data_ptr(),
-      data.numel(),
-      mpiDatatype.at(data.scalar_type()),
-      mpiOp.at(opts.reduceOp),
-      mpixStreamComm_));
-#else
+  
+  // Add profiling support for MPI operations
+  auto tensor = tensors[0];
+  RECORD_PARAM_COMMS_DATA(
+      std::make_tuple(
+          static_cast<int64_t>(0),
+          false),
+      std::make_tuple(pg_uid_, pg_desc_),
+      tensors,
+      tensors,
+      rank_,
+      "allreduce",
+      tensor.numel(),
+      tensor.numel(),
+      tensor.scalar_type(),
+      std::vector<int64_t>(),
+      std::vector<int64_t>(),
+      0,
+      1,
+      size_); 
+  
+#ifdef USE_MPIX_STREAM
+  
+  if (hasMPIXStream() && tensors[0].is_cuda()) {
+    try {
+      auto work = createMPIXWork(tensors, "mpix:all_reduce", enableTiming_);
+      
+      
+      at::cuda::CUDAStreamGuard streamGuard(getMPIXCudaStream());
+      
+      
+      TORCH_CHECK(tensors[0].data_ptr() != nullptr,
+                  "Tensor data pointer is null");
+      TORCH_CHECK(tensors[0].numel() > 0,
+                  "Cannot perform allreduce on empty tensor");
+      
+      
+      auto scalar_type = tensors[0].scalar_type();
+      if (mpiDatatype.find(scalar_type) == mpiDatatype.end()) {
+        TORCH_CHECK(false, "Unsupported tensor scalar type for MPIX operations: ", scalar_type);
+      }
+      
+      
+      if (mpiOp.find(opts.reduceOp) == mpiOp.end()) {
+        TORCH_CHECK(false, "Unsupported reduction operation for MPIX: ", opts.reduceOp);
+      }
+      
+      MPI_CHECK(MPIX_Allreduce_enqueue(
+          MPI_IN_PLACE,
+          tensors[0].data_ptr(),
+          tensors[0].numel(),
+          mpiDatatype.at(scalar_type),
+          mpiOp.at(opts.reduceOp),
+          getMPIXStreamComm()));
+      
+      
+      work->endEvent_->record(getMPIXCudaStream());
+      
+      return work;
+      
+    } catch (const std::exception& e) {
+      TORCH_WARN("MPIX allreduce failed: ", e.what(), ". Falling back to traditional MPI.");
+    }
+  }
+#endif
+  
+  // Traditional MPI path
   cudaDeviceSynchronize();
   std::function<void(std::unique_ptr<WorkEntry>&)> runFunc =
       [opts, this](std::unique_ptr<WorkEntry>& entry) {
@@ -485,7 +798,6 @@ c10::intrusive_ptr<Work> ProcessGroupMPI::allreduce(
       std::move(entry),
       "mpi:all_reduce",
       std::optional<std::vector<at::Tensor>>(tensors));
-#endif
 }
 
 c10::intrusive_ptr<Work> ProcessGroupMPI::allreduce_coalesced(

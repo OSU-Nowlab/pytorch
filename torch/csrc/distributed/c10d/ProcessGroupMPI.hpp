@@ -17,9 +17,12 @@
 #include <torch/csrc/distributed/c10d/Backend.hpp>
 #include <torch/csrc/distributed/c10d/Types.hpp>
 #include <torch/csrc/distributed/c10d/Utils.hpp>
+// Profiling support: PARAM_COMMS_DATA
+#include <torch/csrc/distributed/c10d/ParamCommsUtils.hpp>
 
-#ifdef USE_CUDA_MPI
+#ifdef USE_MPIX_STREAM
 #include <c10/cuda/CUDAStream.h>
+#include <ATen/cuda/CUDAEvent.h>
 #endif
 
 #include <mpi.h>
@@ -142,6 +145,71 @@ class TORCH_API ProcessGroupMPI : public Backend {
     MPI_Request request_;
     MPI_Status status_{};
   };
+
+#ifdef USE_MPIX_STREAM
+  class MPIXStreamWork : public Work {
+   public:
+    explicit MPIXStreamWork(
+        std::vector<at::Tensor> outputTensors,
+        const char* profilingTitle = nullptr,
+        const std::optional<std::vector<at::Tensor>>& inputTensors = std::nullopt,
+        bool enableTiming = false);
+
+    ~MPIXStreamWork() override;
+
+    bool isCompleted() override;
+
+    bool isSuccess() const override;
+
+    bool wait(std::chrono::milliseconds timeout = kUnsetTimeout) override;
+
+    void abort() override;
+
+    
+    void synchronize() override;
+
+    
+    std::vector<at::Tensor> result() override;
+
+    
+    c10::intrusive_ptr<c10::ivalue::Future> getFuture() override;
+
+    
+    float getDuration() const;
+
+   private:
+    
+    bool finishedGPUExecutionInternal() const;
+
+    
+    void setException(std::exception_ptr exception_ptr);
+
+    
+    std::vector<at::Tensor> outputTensors_;
+
+    // for comms duration capture
+    std::shared_ptr<at::cuda::CUDAEvent> startEvent_;
+    std::shared_ptr<at::cuda::CUDAEvent> endEvent_;
+
+    
+    at::Device device_;
+
+    
+    at::cuda::CUDAStream cudaStream_;
+
+    
+    c10::intrusive_ptr<at::ivalue::Future> future_;
+
+    
+    std::exception_ptr exception_;
+    std::mutex mutex_;
+
+    
+    bool timingEnabled_;
+
+    friend class ProcessGroupMPI;
+  };
+#endif // USE_MPIX_STREAM
 
   // Constructor will spawn up the worker thread loop
   explicit ProcessGroupMPI(int rank, int size, MPI_Comm pgComm);
@@ -271,10 +339,31 @@ class TORCH_API ProcessGroupMPI : public Backend {
   static int mpiThreadSupport_;
 
   MPI_Comm pgComm_;
-// add USE_CUDA_MPI guard
-#ifdef USE_CUDA_MPI
+// add USE_MPIX_STREAM guard
+#ifdef USE_MPIX_STREAM
     MPI_Comm mpixStreamComm_;
     MPIX_Stream mpixStream_;
+    
+    // only one stream per MPIX PG 
+    // TODO: multiple device-stream per PG, might need stream map impl
+    at::cuda::CUDAStream mpixCudaStream_;
+    
+    
+    bool hasMPIXStream() const { return mpixStreamComm_ != MPI_COMM_NULL; }
+    at::cuda::CUDAStream& getMPIXCudaStream() { return mpixCudaStream_; }
+    MPI_Comm getMPIXStreamComm() const { return mpixStreamComm_; }
+    
+    
+    void enableCollectivesTiming() { enableTiming_ = true; }
+    
+    
+    c10::intrusive_ptr<MPIXStreamWork> createMPIXWork(
+        std::vector<at::Tensor>& tensors,
+        const char* profilingTitle = nullptr,
+        bool enableTiming = false);
+    
+    
+    bool enableTiming_ = false;
 #endif
 };
 
