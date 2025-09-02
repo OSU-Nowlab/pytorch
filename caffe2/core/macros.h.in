@@ -8,6 +8,7 @@
 #cmakedefine CAFFE2_BUILD_SHARED_LIBS
 #cmakedefine CAFFE2_FORCE_FALLBACK_CUDA_MPI
 #cmakedefine CAFFE2_USE_CUDA_MPI
+#cmakedefine CAFFE2_USE_MPIX_STREAM
 #cmakedefine CAFFE2_HAS_MKL_DNN
 #cmakedefine CAFFE2_HAS_MKL_SGEMM_PACK
 #cmakedefine CAFFE2_PERF_WITH_AVX
@@ -48,6 +49,7 @@
   {"USE_NCCL", "${USE_NCCL}"}, \
   {"USE_MPI", "${USE_MPI}"}, \
   {"USE_CUDA_MPI", "${USE_CUDA_MPI}"}, \
+  {"USE_MPIX_STREAM", "${USE_MPIX_STREAM}"}, \
   {"USE_GFLAGS", "${USE_GFLAGS}"}, \
   {"USE_GLOG", "${USE_GLOG}"}, \
   {"USE_GLOO", "${USE_GLOO}"}, \
