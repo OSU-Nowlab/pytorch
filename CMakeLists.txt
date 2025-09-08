@@ -333,10 +333,10 @@ cmake_dependent_option(
     "USE_DISTRIBUTED" OFF)
 cmake_dependent_option(
     USE_CUDA_MPI "Force CUDA-Aware MPI for Caffe2. Only available if USE_DISTRIBUTED and USE_MPI is on." OFF
-    "USE_DISTRIBUTED AND USE_MPI" OFF)
+    "USE_DISTRIBUTED;USE_MPI" OFF)
 cmake_dependent_option(
     USE_MPIX_STREAM "Force CUDA-Aware MPICH MPIX Stream Extension. Only available if USE_DISTRIBUTED and USE_MPI and USE_CUDA_MPI is on." OFF
-    "USE_DISTRIBUTED AND USE_MPI AND USE_CUDA_MPI" OFF)
+    "USE_DISTRIBUTED;USE_MPI;USE_CUDA_MPI" OFF)
 cmake_dependent_option(
   USE_UCC "Use UCC. Only available if USE_DISTRIBUTED is on." OFF
   "USE_DISTRIBUTED" OFF)

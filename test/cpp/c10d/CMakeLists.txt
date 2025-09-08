@@ -77,7 +77,11 @@ if(USE_MPI AND USE_C10D_MPI)
   # private headers of libtorch, which in turn include MPI. As a hacky
   # alternative to making MPI a public dependency of libtorch, we make it
   # a private dependency of the tests as well.
-  c10d_add_test(ProcessGroupMPITest.cpp LINK_LIBRARIES torch_cpu MPI::MPI_CXX INSTALL_TEST ${INSTALL_TEST})
+  if(USE_CUDA_MPI AND USE_MPIX_STREAM)
+    c10d_add_test(ProcessGroupMPITest.cpp LINK_LIBRARIES torch_cpu c10d_cuda_test MPI::MPI_CXX INSTALL_TEST ${INSTALL_TEST})
+  else()
+    c10d_add_test(ProcessGroupMPITest.cpp LINK_LIBRARIES torch_cpu MPI::MPI_CXX INSTALL_TEST ${INSTALL_TEST})
+  endif()
 endif()
 
 if(LINUX AND USE_GLOO AND USE_C10D_GLOO)
