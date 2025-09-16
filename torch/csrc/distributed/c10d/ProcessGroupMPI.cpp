@@ -243,6 +243,7 @@ ProcessGroupMPI::MPIXStreamWork::MPIXStreamWork(
     : Work(-1, OpType::UNKNOWN, profilingTitle, inputTensors),
       outputTensors_(std::move(outputTensors)),
       device_(outputTensors_.empty() ? at::Device("cuda") : outputTensors_[0].device()),
+      cudaStream_(at::cuda::getCurrentCUDAStream(device_.index())),
       future_(c10::make_intrusive<at::ivalue::Future>(
           c10::ListType::create(c10::TensorType::get()))),
       timingEnabled_(enableTiming) {
@@ -281,7 +282,6 @@ bool ProcessGroupMPI::MPIXStreamWork::isCompleted() {
 }
 
 bool ProcessGroupMPI::MPIXStreamWork::isSuccess() const {
-  std::lock_guard<std::mutex> lock(mutex_);
   return finishedGPUExecutionInternal() && !exception_;
 }
 
@@ -560,7 +560,11 @@ inline std::string getKeyFromDevice(at::Device& device) {
 }
 
 ProcessGroupMPI::ProcessGroupMPI(int rank, int size, MPI_Comm pgComm)
-    : Backend(rank, size), stop_(false), pgComm_(pgComm) {
+    : Backend(rank, size), stop_(false), pgComm_(pgComm),
+#ifdef USE_MPIX_STREAM
+      mpixCudaStream_(at::cuda::getCurrentCUDAStream())
+#endif
+{
   if (pgComm_ == MPI_COMM_NULL) {
     TORCH_CHECK(false, "pgComm_ must not be MPI_COMM_NULL");
   }
@@ -712,26 +716,6 @@ c10::intrusive_ptr<Work> ProcessGroupMPI::allreduce(
     const AllreduceOptions& opts) {
   checkSingleTensor(tensors);
   
-  // Add profiling support for MPI operations
-  auto tensor = tensors[0];
-  RECORD_PARAM_COMMS_DATA(
-      std::make_tuple(
-          static_cast<int64_t>(0),
-          false),
-      std::make_tuple(pg_uid_, pg_desc_),
-      tensors,
-      tensors,
-      rank_,
-      "allreduce",
-      tensor.numel(),
-      tensor.numel(),
-      tensor.scalar_type(),
-      std::vector<int64_t>(),
-      std::vector<int64_t>(),
-      0,
-      1,
-      size_); 
-  
 #ifdef USE_MPIX_STREAM
   
   if (hasMPIXStream() && tensors[0].is_cuda()) {
@@ -777,7 +761,7 @@ c10::intrusive_ptr<Work> ProcessGroupMPI::allreduce(
   }
 #endif
   
-  // Traditional MPI path
+  // Traditional MPI path (when USE_MPIX_STREAM not defined)
   cudaDeviceSynchronize();
   std::function<void(std::unique_ptr<WorkEntry>&)> runFunc =
       [opts, this](std::unique_ptr<WorkEntry>& entry) {

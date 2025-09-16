@@ -165,46 +165,35 @@ class TORCH_API ProcessGroupMPI : public Backend {
 
     void abort() override;
 
-    
     void synchronize() override;
-
     
     std::vector<at::Tensor> result() override;
 
-    
     c10::intrusive_ptr<c10::ivalue::Future> getFuture() override;
 
-    
-    float getDuration() const;
+    float getDuration() const override;
 
    private:
     
     bool finishedGPUExecutionInternal() const;
 
-    
     void setException(std::exception_ptr exception_ptr);
 
-    
     std::vector<at::Tensor> outputTensors_;
 
     // for comms duration capture
     std::shared_ptr<at::cuda::CUDAEvent> startEvent_;
     std::shared_ptr<at::cuda::CUDAEvent> endEvent_;
 
-    
     at::Device device_;
-
     
     at::cuda::CUDAStream cudaStream_;
 
-    
     c10::intrusive_ptr<at::ivalue::Future> future_;
 
-    
     std::exception_ptr exception_;
     std::mutex mutex_;
 
-    
     bool timingEnabled_;
 
     friend class ProcessGroupMPI;
@@ -353,15 +342,12 @@ class TORCH_API ProcessGroupMPI : public Backend {
     at::cuda::CUDAStream& getMPIXCudaStream() { return mpixCudaStream_; }
     MPI_Comm getMPIXStreamComm() const { return mpixStreamComm_; }
     
-    
-    void enableCollectivesTiming() { enableTiming_ = true; }
-    
+    void enableCollectivesTiming() override { enableTiming_ = true; }
     
     c10::intrusive_ptr<MPIXStreamWork> createMPIXWork(
         std::vector<at::Tensor>& tensors,
         const char* profilingTitle = nullptr,
         bool enableTiming = false);
-    
     
     bool enableTiming_ = false;
 #endif
