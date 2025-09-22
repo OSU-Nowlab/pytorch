@@ -247,38 +247,28 @@ ProcessGroupMPI::MPIXStreamWork::MPIXStreamWork(
       future_(c10::make_intrusive<at::ivalue::Future>(
           c10::ListType::create(c10::TensorType::get()))),
       timingEnabled_(enableTiming) {
-  
-  try {
-    
-    TORCH_CHECK(!outputTensors_.empty(), 
-                "MPIXStreamWork requires at least one output tensor");
-    
-    
-    TORCH_CHECK(device_.is_cuda(), 
-                "MPIXStreamWork requires CUDA device, got: ", device_);
-    
-    if (timingEnabled_) {
-      startEvent_ = std::make_shared<at::cuda::CUDAEvent>(cudaEventDisableTiming);
-      TORCH_CHECK(startEvent_, "Failed to create start event for MPIXStreamWork");
-    }
-    
+
+  TORCH_CHECK(!outputTensors_.empty(),
+              "MPIXStreamWork requires at least one output tensor");
+
+  TORCH_CHECK(device_.is_cuda(),
+              "MPIXStreamWork requires CUDA device, got: ", device_);
+
+  if (timingEnabled_) {
+    startEvent_ = std::make_shared<at::cuda::CUDAEvent>();
+    TORCH_CHECK(startEvent_, "Failed to create start event for MPIXStreamWork");
+    endEvent_ = std::make_shared<at::cuda::CUDAEvent>();
+    TORCH_CHECK(endEvent_, "Failed to create end event for MPIXStreamWork");
+  } else {
     endEvent_ = std::make_shared<at::cuda::CUDAEvent>(cudaEventDisableTiming);
     TORCH_CHECK(endEvent_, "Failed to create end event for MPIXStreamWork");
-    
-  } catch (const std::exception& e) {
-    TORCH_CHECK(false, "Failed to construct MPIXStreamWork: ", e.what());
   }
 }
 
 ProcessGroupMPI::MPIXStreamWork::~MPIXStreamWork() = default;
 
 bool ProcessGroupMPI::MPIXStreamWork::isCompleted() {
-  try {
-    return finishedGPUExecutionInternal();
-  } catch (...) {
-    setException(std::current_exception());
-    return true;
-  }
+  return finishedGPUExecutionInternal();
 }
 
 bool ProcessGroupMPI::MPIXStreamWork::isSuccess() const {
@@ -291,44 +281,24 @@ bool ProcessGroupMPI::MPIXStreamWork::wait(std::chrono::milliseconds timeout) {
     return true;
   }
 
-  try {
-    
-    if (timeout == kUnsetTimeout) {
-      
-      endEvent_->synchronize();
-    } else {
-      
-      auto start_time = std::chrono::steady_clock::now();
-      while (!finishedGPUExecutionInternal()) {
-        auto elapsed = std::chrono::steady_clock::now() - start_time;
-        if (elapsed >= timeout) {
-          TORCH_WARN("MPIXStreamWork::wait() timed out after ", 
-                     std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count(), "ms");
-          return false;
-        }
-        
-        std::this_thread::sleep_for(std::chrono::microseconds(100));
+  if (timeout == kUnsetTimeout) {
+    endEvent_->synchronize();
+  } else {
+    auto start_time = std::chrono::steady_clock::now();
+    while (!finishedGPUExecutionInternal()) {
+      auto elapsed = std::chrono::steady_clock::now() - start_time;
+      if (elapsed >= timeout) {
+        return false;
       }
+      std::this_thread::sleep_for(std::chrono::microseconds(100));
     }
-    
-    if (exception_) {
-      std::rethrow_exception(exception_);
-    }
-    
-    return true;
-    
-  } catch (const c10::Error& e) {
-    setException(std::current_exception());
-    throw;
-  } catch (const std::exception& e) {
-    setException(std::make_exception_ptr(
-        std::runtime_error(std::string("MPIXStreamWork::wait() failed: ") + e.what())));
-    throw;
-  } catch (...) {
-    setException(std::make_exception_ptr(
-        std::runtime_error("MPIXStreamWork::wait() failed with unknown error")));
-    throw;
   }
+
+  if (exception_) {
+    std::rethrow_exception(exception_);
+  }
+
+  return true;
 }
 
 void ProcessGroupMPI::MPIXStreamWork::abort() {
@@ -337,32 +307,12 @@ void ProcessGroupMPI::MPIXStreamWork::abort() {
 }
 
 void ProcessGroupMPI::MPIXStreamWork::synchronize() {
-  try {
-    
-    auto currentStream = at::cuda::getCurrentCUDAStream(device_.index());
-    
-    
-    TORCH_CHECK(device_.index() >= 0, 
-                "Invalid device index: ", device_.index());
-    
-    
-    endEvent_->block(currentStream);
-    
-    if (exception_) {
-      std::rethrow_exception(exception_);
-    }
-    
-  } catch (const c10::Error& e) {
-    setException(std::current_exception());
-    throw;
-  } catch (const std::exception& e) {
-    setException(std::make_exception_ptr(
-        std::runtime_error(std::string("MPIXStreamWork::synchronize() failed: ") + e.what())));
-    throw;
-  } catch (...) {
-    setException(std::make_exception_ptr(
-        std::runtime_error("MPIXStreamWork::synchronize() failed with unknown error")));
-    throw;
+  auto currentStream = at::cuda::getCurrentCUDAStream(device_.index());
+  TORCH_CHECK(device_.index() >= 0,
+              "Invalid device index: ", device_.index());
+  endEvent_->block(currentStream);
+  if (exception_) {
+    std::rethrow_exception(exception_);
   }
 }
 
@@ -375,36 +325,14 @@ c10::intrusive_ptr<c10::ivalue::Future> ProcessGroupMPI::MPIXStreamWork::getFutu
 }
 
 float ProcessGroupMPI::MPIXStreamWork::getDuration() const {
-  try {
-    TORCH_CHECK(timingEnabled_, "getDuration only works if timing was enabled");
-    TORCH_CHECK(
-        startEvent_,
-        "getDuration only works if startEvent_ is populated, true if timing enabled");
-    TORCH_CHECK(
-        endEvent_,
-        "getDuration only works if endEvent_ is populated, which should always be true");
-    
-    
-    if (!finishedGPUExecutionInternal()) {
-      TORCH_WARN("getDuration() called before operation completed, results may be inaccurate");
-    }
-    
-    return startEvent_->elapsed_time(*endEvent_);
-    
-  } catch (const std::exception& e) {
-    TORCH_CHECK(false, "getDuration() failed: ", e.what());
-  }
+  TORCH_CHECK(timingEnabled_, "getDuration only works if timing was enabled");
+  TORCH_CHECK(startEvent_, "startEvent_ must be initialized for timing");
+  TORCH_CHECK(endEvent_, "endEvent_ must be initialized for timing");
+  return startEvent_->elapsed_time(*endEvent_);
 }
 
 bool ProcessGroupMPI::MPIXStreamWork::finishedGPUExecutionInternal() const {
-  try {
-    TORCH_CHECK(endEvent_, "endEvent_ is null, cannot query completion status");
-    return endEvent_->query();
-  } catch (const std::exception& e) {
-    
-    TORCH_WARN("finishedGPUExecutionInternal() failed: ", e.what());
-    return false; // Assume not completed on error
-  }
+  return endEvent_ ? endEvent_->query() : false;
 }
 
 void ProcessGroupMPI::MPIXStreamWork::setException(std::exception_ptr exception_ptr) {
@@ -445,21 +373,12 @@ c10::intrusive_ptr<ProcessGroupMPI::MPIXStreamWork> ProcessGroupMPI::createMPIXW
                 " is not contiguous.");
   }
   
-  try {
-    auto work = c10::make_intrusive<MPIXStreamWork>(tensors, profilingTitle, std::nullopt, enableTiming);
-    
-    
-    work->cudaStream_ = getMPIXCudaStream();
-    
-    
-    if (work->startEvent_) {
-      work->startEvent_->record(getMPIXCudaStream());
-    }
-    
-    return work;
-  } catch (const std::exception& e) {
-    TORCH_CHECK(false, "Failed to create MPIXStreamWork: ", e.what());
+  auto work = c10::make_intrusive<MPIXStreamWork>(tensors, profilingTitle, std::nullopt, enableTiming);
+  work->cudaStream_ = getMPIXCudaStream();
+  if (work->startEvent_) {
+    work->startEvent_->record(getMPIXCudaStream());
   }
+  return work;
 }
 #endif // USE_MPIX_STREAM
 
