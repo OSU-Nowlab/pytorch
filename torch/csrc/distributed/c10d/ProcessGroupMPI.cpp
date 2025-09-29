@@ -260,6 +260,8 @@ ProcessGroupMPI::MPIXStreamWork::MPIXStreamWork(
     endEvent_ = std::make_shared<at::cuda::CUDAEvent>();
     TORCH_CHECK(endEvent_, "Failed to create end event for MPIXStreamWork");
   } else {
+    startEvent_ = std::make_shared<at::cuda::CUDAEvent>(cudaEventDisableTiming);
+    TORCH_CHECK(startEvent_, "Failed to create start event for MPIXStreamWork");
     endEvent_ = std::make_shared<at::cuda::CUDAEvent>(cudaEventDisableTiming);
     TORCH_CHECK(endEvent_, "Failed to create end event for MPIXStreamWork");
   }
@@ -376,7 +378,9 @@ c10::intrusive_ptr<ProcessGroupMPI::MPIXStreamWork> ProcessGroupMPI::createMPIXW
   auto work = c10::make_intrusive<MPIXStreamWork>(tensors, profilingTitle, std::nullopt, enableTiming);
   work->cudaStream_ = getMPIXCudaStream();
   if (work->startEvent_) {
-    work->startEvent_->record(getMPIXCudaStream());
+    auto userStream = at::cuda::getCurrentCUDAStream(tensors[0].device().index());
+    work->startEvent_->record(userStream);
+    work->startEvent_->block(getMPIXCudaStream());
   }
   return work;
 }
@@ -508,7 +512,8 @@ ProcessGroupMPI::ProcessGroupMPI(int rank, int size, MPI_Comm pgComm)
       MPI_CHECK(MPI_Info_set(info, "type", "cudaStream_t"));
       MPI_CHECK(MPIX_Info_set_hex(info, "value", &streamVal, sizeof(streamVal)));
       MPI_CHECK(MPIX_Stream_create(info, &mpixStream_));
-      MPI_CHECK(MPIX_Stream_comm_create(MPI_COMM_WORLD, mpixStream_, &mpixStreamComm_));
+      // Use the process group's communicator rather than MPI_COMM_WORLD
+      MPI_CHECK(MPIX_Stream_comm_create(pgComm_, mpixStream_, &mpixStreamComm_));
     } catch (...) {
       MPI_Info_free(&info);
       throw;
@@ -644,6 +649,10 @@ c10::intrusive_ptr<Work> ProcessGroupMPI::allreduce(
       
       at::cuda::CUDAStreamGuard streamGuard(getMPIXCudaStream());
       
+      if (!tensors[0].is_sparse()) {
+        c10::cuda::CUDACachingAllocator::recordStream(
+            tensors[0].storage().data_ptr(), getMPIXCudaStream());
+      }
       
       TORCH_CHECK(tensors[0].data_ptr() != nullptr,
                   "Tensor data pointer is null");
