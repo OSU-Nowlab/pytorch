@@ -499,33 +499,45 @@ ProcessGroupMPI::ProcessGroupMPI(int rank, int size, MPI_Comm pgComm)
 #ifdef USE_MPIX_STREAM
   
   mpixStreamComm_ = MPI_COMM_NULL; // Initialize to invalid state
-  try {
-    
-    mpixCudaStream_ = at::cuda::getStreamFromPool();
-    cudaStream_t streamVal = mpixCudaStream_.stream();
-    
-    
-    MPI_Info info;
-    MPI_CHECK(MPI_Info_create(&info));
-    
-    try {
-      MPI_CHECK(MPI_Info_set(info, "type", "cudaStream_t"));
-      MPI_CHECK(MPIX_Info_set_hex(info, "value", &streamVal, sizeof(streamVal)));
-      MPI_CHECK(MPIX_Stream_create(info, &mpixStream_));
-      // Use the process group's communicator rather than MPI_COMM_WORLD
-      MPI_CHECK(MPIX_Stream_comm_create(pgComm_, mpixStream_, &mpixStreamComm_));
-    } catch (...) {
-      MPI_Info_free(&info);
-      throw;
+  // Runtime gating: default disabled; enable only if USE_MPIX_STREAM is "1" or "on"
+  bool mpixStreamEnabled = false;
+  if (const char* envVal = std::getenv("USE_MPIX_STREAM")) {
+    std::string val(envVal);
+    std::transform(val.begin(), val.end(), val.begin(), [](unsigned char c){ return static_cast<char>(std::tolower(c)); });
+    if (val == "1" || val == "on") {
+      mpixStreamEnabled = true;
     }
-    
-    MPI_CHECK(MPI_Info_free(&info));
-    
-  } catch (const std::exception& e) {
-    
-    TORCH_WARN("Failed to initialize MPIX stream support: ", e.what(), 
-               ". Falling back to traditional MPI operations.");
-    mpixStreamComm_ = MPI_COMM_NULL;
+  }
+
+  if (mpixStreamEnabled) {
+    try {
+      
+      mpixCudaStream_ = at::cuda::getStreamFromPool();
+      cudaStream_t streamVal = mpixCudaStream_.stream();
+      
+      
+      MPI_Info info;
+      MPI_CHECK(MPI_Info_create(&info));
+      
+      try {
+        MPI_CHECK(MPI_Info_set(info, "type", "cudaStream_t"));
+        MPI_CHECK(MPIX_Info_set_hex(info, "value", &streamVal, sizeof(streamVal)));
+        MPI_CHECK(MPIX_Stream_create(info, &mpixStream_));
+        // Use the process group's communicator rather than MPI_COMM_WORLD
+        MPI_CHECK(MPIX_Stream_comm_create(pgComm_, mpixStream_, &mpixStreamComm_));
+      } catch (...) {
+        MPI_Info_free(&info);
+        throw;
+      }
+      
+      MPI_CHECK(MPI_Info_free(&info));
+      
+    } catch (const std::exception& e) {
+      
+      TORCH_WARN("Failed to initialize MPIX stream support: ", e.what(), 
+                 ". Falling back to traditional MPI operations.");
+      mpixStreamComm_ = MPI_COMM_NULL;
+    }
   }
 #endif
 }
