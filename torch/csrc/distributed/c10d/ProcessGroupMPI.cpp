@@ -745,7 +745,7 @@ c10::intrusive_ptr<Work> ProcessGroupMPI::reduce_scatter(
       std::optional<std::vector<at::Tensor>>(inputTensors[0]));
 
 }
-
+/*
 c10::intrusive_ptr<Work> ProcessGroupMPI::_reduce_scatter_base(
     at::Tensor& outputTensor,
     at::Tensor& inputTensor,
@@ -789,6 +789,7 @@ c10::intrusive_ptr<Work> ProcessGroupMPI::_reduce_scatter_base(
             ? std::optional<std::vector<at::Tensor>>(inputTensors)
             : std::nullopt);
 }
+*/
 
 
 c10::intrusive_ptr<Work> ProcessGroupMPI::alltoall_base(
@@ -1042,10 +1043,11 @@ c10::intrusive_ptr<Work> ProcessGroupMPI::_allgather_base(
     at::Tensor& outputTensor,
     at::Tensor& inputTensor,
     const AllgatherOptions& opts) {
-<<<<<<< HEAD
   TORCH_CHECK(
       outputTensor.numel() == inputTensor.numel() * size_,
       "All gather: output tensor size must be equal to input tensor size times the world size");
+
+  cudaDeviceSynchronize();
 
   std::function<void(std::unique_ptr<WorkEntry>&)> runFunc =
       [this](std::unique_ptr<WorkEntry>& entry) {
@@ -1081,6 +1083,8 @@ c10::intrusive_ptr<Work> ProcessGroupMPI::_reduce_scatter_base(
       outputTensor.numel() * size_ == inputTensor.numel(),
       "Reduce scatter: input tensor size must be equal to output tensor size times the world size");
 
+  cudaDeviceSynchronize();
+
   std::function<void(std::unique_ptr<WorkEntry>&)> runFunc =
       [opts, this](std::unique_ptr<WorkEntry>& entry) {
         auto dstdata = (entry->dst)[0];
@@ -1103,37 +1107,6 @@ c10::intrusive_ptr<Work> ProcessGroupMPI::_reduce_scatter_base(
   return enqueue(
       std::move(entry),
       "mpi:_reduce_scatter_base",
-=======
-  
-  checkSingleTensorHelper(inputTensor);
-  checkSingleTensorHelper(outputTensor);
-  cudaDeviceSynchronize();
-
-  std::function<void(std::unique_ptr<WorkEntry>&)> runFunc =
-      [this](std::unique_ptr<WorkEntry>& entry) {
-        auto& src = (entry->src)[0];
-        auto& dst = (entry->dst)[0];
-
-        c10::DeviceGuard guard(src.device());
-        std::unique_lock<std::mutex> globalLock(pgGlobalMutex_);
-
-        MPI_CHECK(MPI_Allgather(
-            src.data_ptr(),
-            src.numel(),
-            mpiDatatype.at(src.scalar_type()),
-            dst.data_ptr(),
-            src.numel(),
-            mpiDatatype.at(src.scalar_type()),
-            pgComm_));
-      };
-      
-  std::vector<at::Tensor> inputTensors = {inputTensor};
-  std::vector<at::Tensor> outputTensors = {outputTensor};
-  auto entry = std::make_unique<WorkEntry>(&inputTensors, &outputTensors, std::move(runFunc));
-  return enqueue(
-      std::move(entry),
-      "mpi:allgather-base",
->>>>>>> d9f69c2f174 (Additional MPI collectives & device sync & force cuda-aware)
       std::optional<std::vector<at::Tensor>>(inputTensors));
 }
 
