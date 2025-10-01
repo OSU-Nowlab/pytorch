@@ -690,7 +690,8 @@ c10::intrusive_ptr<Work> ProcessGroupMPI::allreduce(
           mpiOp.at(opts.reduceOp),
           getMPIXStreamComm()));
       
-      
+      getMPIXCudaStream().synchronize();
+
       work->endEvent_->record(getMPIXCudaStream());
       
       return work;
