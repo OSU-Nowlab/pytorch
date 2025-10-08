@@ -245,7 +245,8 @@ ProcessGroupMPI::MPIXStreamWork::MPIXStreamWork(
       device_(outputTensors_.empty() ? at::Device("cuda") : outputTensors_[0].device()),
       cudaStream_(at::cuda::getCurrentCUDAStream(device_.index())),
       future_(c10::make_intrusive<at::ivalue::Future>(
-          c10::ListType::create(c10::TensorType::get()))),
+          c10::ListType::create(c10::TensorType::get()),
+          std::vector<at::Device>{device_})),
       timingEnabled_(enableTiming) {
 
   TORCH_CHECK(!outputTensors_.empty(),
@@ -689,10 +690,13 @@ c10::intrusive_ptr<Work> ProcessGroupMPI::allreduce(
           mpiDatatype.at(scalar_type),
           mpiOp.at(opts.reduceOp),
           getMPIXStreamComm()));
-      
-      getMPIXCudaStream().synchronize();
 
       work->endEvent_->record(getMPIXCudaStream());
+
+      auto fut = work->getFuture();
+      if (fut && !fut->completed()) {
+        fut->markCompleted(at::IValue(work->result()));
+      }
       
       return work;
       
