@@ -242,6 +242,7 @@ ProcessGroupMPI::MPIXStreamWork::MPIXStreamWork(
     bool enableTiming)
     : Work(-1, OpType::UNKNOWN, profilingTitle, inputTensors),
       outputTensors_(std::move(outputTensors)),
+      inputTensors_(inputTensors.has_value() ? *inputTensors : std::vector<at::Tensor>()),
       device_(outputTensors_.empty() ? at::Device("cuda") : outputTensors_[0].device()),
       cudaStream_(at::cuda::getCurrentCUDAStream(device_.index())),
       future_(c10::make_intrusive<at::ivalue::Future>(
@@ -348,7 +349,8 @@ void ProcessGroupMPI::MPIXStreamWork::setException(std::exception_ptr exception_
 c10::intrusive_ptr<ProcessGroupMPI::MPIXStreamWork> ProcessGroupMPI::createMPIXWork(
     std::vector<at::Tensor>& tensors,
     const char* profilingTitle,
-    bool enableTiming) {
+    bool enableTiming,
+    const std::optional<std::vector<at::Tensor>>& inputTensors) {
   
   
   TORCH_CHECK(hasMPIXStream(), 
@@ -376,7 +378,7 @@ c10::intrusive_ptr<ProcessGroupMPI::MPIXStreamWork> ProcessGroupMPI::createMPIXW
                 " is not contiguous.");
   }
   
-  auto work = c10::make_intrusive<MPIXStreamWork>(tensors, profilingTitle, std::nullopt, enableTiming);
+  auto work = c10::make_intrusive<MPIXStreamWork>(tensors, profilingTitle, inputTensors, enableTiming);
   work->cudaStream_ = getMPIXCudaStream();
   if (work->startEvent_) {
     auto userStream = at::cuda::getCurrentCUDAStream(tensors[0].device().index());
@@ -657,7 +659,8 @@ c10::intrusive_ptr<Work> ProcessGroupMPI::allreduce(
   
   if (hasMPIXStream() && tensors[0].is_cuda()) {
     try {
-      auto work = createMPIXWork(tensors, "mpix:all_reduce", enableTiming_);
+      // For in-place allreduce, tensors are both input and output
+      auto work = createMPIXWork(tensors, "mpix:all_reduce", enableTiming_, tensors);
       
       
       at::cuda::CUDAStreamGuard streamGuard(getMPIXCudaStream());
@@ -1026,6 +1029,68 @@ c10::intrusive_ptr<Work> ProcessGroupMPI::_reduce_scatter_base(
 
     checkSingleTensorHelper(inputTensor);
     checkSingleTensorHelper(outputTensor);
+    
+#ifdef USE_MPIX_STREAM
+    // MPIX stream path for CUDA tensors
+    if (hasMPIXStream() && inputTensor.is_cuda()) {
+      try {
+        std::vector<at::Tensor> outputTensors = {outputTensor};
+        std::vector<at::Tensor> inputTensors = {inputTensor};
+        auto work = createMPIXWork(outputTensors, "mpix:reduce_scatter_base", enableTiming_, inputTensors);
+        
+        // Use MPIX CUDA stream
+        at::cuda::CUDAStreamGuard streamGuard(getMPIXCudaStream());
+        
+        // Record tensor streams
+        if (!inputTensor.is_sparse()) {
+          c10::cuda::CUDACachingAllocator::recordStream(
+              inputTensor.storage().data_ptr(), getMPIXCudaStream());
+        }
+        if (!outputTensor.is_sparse()) {
+          c10::cuda::CUDACachingAllocator::recordStream(
+              outputTensor.storage().data_ptr(), getMPIXCudaStream());
+        }
+      
+        TORCH_CHECK(inputTensor.numel() == outputTensor.numel() * size_,
+                    "Input tensor size must be output size * world size");
+        
+        auto scalar_type = inputTensor.scalar_type();
+        if (mpiDatatype.find(scalar_type) == mpiDatatype.end()) {
+          TORCH_CHECK(false, "Unsupported tensor scalar type for MPIX operations: ", scalar_type);
+        }
+        
+        if (mpiOp.find(opts.reduceOp) == mpiOp.end()) {
+          TORCH_CHECK(false, "Unsupported reduction operation for MPIX: ", opts.reduceOp);
+        }
+        
+        // Store recvcounts in work object to ensure it lives until operation completes
+        work->recvcounts_.resize(size_);
+        const int sendcount = inputTensor.numel() / (size_);
+        std::fill_n(work->recvcounts_.data(), size_, sendcount);
+        
+        MPI_CHECK(MPIX_Reduce_scatter_enqueue(
+            inputTensor.data_ptr(),
+            outputTensor.data_ptr(),
+            work->recvcounts_.data(),
+            mpiDatatype.at(scalar_type),
+            mpiOp.at(opts.reduceOp),
+            getMPIXStreamComm()));
+
+        work->endEvent_->record(getMPIXCudaStream());
+
+        auto fut = work->getFuture();
+        if (fut && !fut->completed()) {
+          fut->markCompleted(at::IValue(work->result()));
+        }
+        
+        return work;
+        
+      } catch (const std::exception& e) {
+        TORCH_WARN("MPIX reduce_scatter_base failed: ", e.what(), ". Falling back to traditional MPI.");
+      }
+    }
+#endif
+    
     cudaDeviceSynchronize();
 
     std::function<void(std::unique_ptr<WorkEntry>&)> runFunc =
@@ -1318,6 +1383,64 @@ c10::intrusive_ptr<Work> ProcessGroupMPI::_allgather_base(
   
   checkSingleTensorHelper(inputTensor);
   checkSingleTensorHelper(outputTensor);
+  
+#ifdef USE_MPIX_STREAM
+  // MPIX stream path for CUDA tensors
+  if (hasMPIXStream() && inputTensor.is_cuda()) {
+    try {
+      std::vector<at::Tensor> outputTensors = {outputTensor};
+      std::vector<at::Tensor> inputTensors = {inputTensor};
+      auto work = createMPIXWork(outputTensors, "mpix:allgather_base", enableTiming_, inputTensors);
+      
+      // Use MPIX CUDA stream
+      at::cuda::CUDAStreamGuard streamGuard(getMPIXCudaStream());
+      
+      // Record tensor streams
+      if (!inputTensor.is_sparse()) {
+        c10::cuda::CUDACachingAllocator::recordStream(
+            inputTensor.storage().data_ptr(), getMPIXCudaStream());
+      }
+      if (!outputTensor.is_sparse()) {
+        c10::cuda::CUDACachingAllocator::recordStream(
+            outputTensor.storage().data_ptr(), getMPIXCudaStream());
+      }
+      
+      // Validate inputs
+      TORCH_CHECK(inputTensor.data_ptr() != nullptr, "Input tensor data pointer is null");
+      TORCH_CHECK(outputTensor.data_ptr() != nullptr, "Output tensor data pointer is null");
+      TORCH_CHECK(inputTensor.numel() > 0, "Cannot perform allgather on empty input tensor");
+      TORCH_CHECK(outputTensor.numel() == inputTensor.numel() * size_,
+                  "Output tensor size must be input size * world size");
+      
+      auto scalar_type = inputTensor.scalar_type();
+      if (mpiDatatype.find(scalar_type) == mpiDatatype.end()) {
+        TORCH_CHECK(false, "Unsupported tensor scalar type for MPIX operations: ", scalar_type);
+      }
+      
+      MPI_CHECK(MPIX_Allgather_enqueue(
+          inputTensor.data_ptr(),
+          inputTensor.numel(),
+          mpiDatatype.at(scalar_type),
+          outputTensor.data_ptr(),
+          inputTensor.numel(),
+          mpiDatatype.at(scalar_type),
+          getMPIXStreamComm()));
+
+      work->endEvent_->record(getMPIXCudaStream());
+
+      auto fut = work->getFuture();
+      if (fut && !fut->completed()) {
+        fut->markCompleted(at::IValue(work->result()));
+      }
+      
+      return work;
+      
+    } catch (const std::exception& e) {
+      TORCH_WARN("MPIX allgather_base failed: ", e.what(), ". Falling back to traditional MPI.");
+    }
+  }
+#endif
+  
   cudaDeviceSynchronize();
 
   std::function<void(std::unique_ptr<WorkEntry>&)> runFunc =

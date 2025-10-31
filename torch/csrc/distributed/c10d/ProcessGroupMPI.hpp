@@ -180,6 +180,9 @@ class TORCH_API ProcessGroupMPI : public Backend {
     void setException(std::exception_ptr exception_ptr);
 
     std::vector<at::Tensor> outputTensors_;
+    
+    // Keep input tensors alive for allocator safety (similar to NCCL's stashed_for_allocator_safety_)
+    std::vector<at::Tensor> inputTensors_;
 
     // for comms duration capture
     std::shared_ptr<at::cuda::CUDAEvent> startEvent_;
@@ -195,6 +198,8 @@ class TORCH_API ProcessGroupMPI : public Backend {
     std::mutex mutex_;
 
     bool timingEnabled_;
+
+    std::vector<int> recvcounts_;
 
     friend class ProcessGroupMPI;
   };
@@ -347,7 +352,8 @@ class TORCH_API ProcessGroupMPI : public Backend {
     c10::intrusive_ptr<MPIXStreamWork> createMPIXWork(
         std::vector<at::Tensor>& tensors,
         const char* profilingTitle = nullptr,
-        bool enableTiming = false);
+        bool enableTiming = false,
+        const std::optional<std::vector<at::Tensor>>& inputTensors = std::nullopt);
     
     bool enableTiming_ = false;
 #endif
