@@ -346,6 +346,8 @@ class TORCH_API ProcessGroupMPI : public Backend {
     bool hasMPIXStream() const { return mpixStreamComm_ != MPI_COMM_NULL; }
     at::cuda::CUDAStream& getMPIXCudaStream() { return mpixCudaStream_; }
     MPI_Comm getMPIXStreamComm() const { return mpixStreamComm_; }
+
+    void configureMPIXCompletionEvent(void* eventHandle);
     
     void enableCollectivesTiming() override { enableTiming_ = true; }
     
