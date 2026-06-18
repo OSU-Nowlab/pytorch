@@ -1,5 +1,8 @@
 #include <torch/csrc/distributed/c10d/ProcessGroupMPI.hpp>
-
+// Define the bfloat16 MPI datatype if it's not already defined
+#ifndef MPIX_BFLOAT16
+#define MPIX_BFLOAT16 ((MPI_Datatype)0x4c00024c)
+#endif
 #ifdef USE_C10D_MPI
 
 #include <iostream>
