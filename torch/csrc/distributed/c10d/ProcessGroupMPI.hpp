@@ -2,12 +2,21 @@
 
 #ifdef USE_C10D_MPI
 
+#include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <deque>
-#include <exception>
+#include <functional>
+#include <future>
+#include <list>
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <string>
 #include <thread>
+#include <tuple>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include <ATen/core/ivalue.h>
@@ -16,6 +25,12 @@
 #include <torch/csrc/distributed/c10d/Backend.hpp>
 #include <torch/csrc/distributed/c10d/Types.hpp>
 #include <torch/csrc/distributed/c10d/Utils.hpp>
+#include <torch/csrc/distributed/c10d/PrefixStore.hpp>
+#include <torch/csrc/distributed/c10d/Store.hpp>
+//#include <torch/csrc/distributed/c10d/cuda/CUDAEventCache.hpp>
+
+#include <c10/core/Stream.h>
+#include <c10/core/StreamGuard.h>
 
 #include <mpi.h>
 
@@ -155,8 +170,8 @@ class TORCH_API ProcessGroupMPI : public Backend {
       const BroadcastOptions& opts = BroadcastOptions()) override;
 
   c10::intrusive_ptr<Work> allreduce(
-      std::vector<at::Tensor>& tensors,
-      const AllreduceOptions& opts = AllreduceOptions()) override;
+    std::vector<at::Tensor>& tensors,
+    const AllreduceOptions& opts) override;
 
   c10::intrusive_ptr<Work> allreduce_coalesced(
       std::vector<at::Tensor>& tensors,
@@ -249,10 +264,22 @@ class TORCH_API ProcessGroupMPI : public Backend {
       const std::optional<std::vector<at::Tensor>>& inputTensors =
           std::nullopt);
 
+  template <typename Fn>
+  c10::intrusive_ptr<Work> collective(
+    std::vector<at::Tensor>& input,
+    std::vector<at::Tensor>& output,
+    Fn fn,
+    OpType opType,
+    bool asyncOp,
+    const char* profilingTitle);
+
   bool stop_{false};
 
   std::mutex pgMutex_;
   std::thread workerThread_;
+
+  // The CUDA events used to sync MPI streams
+  std::unordered_map<std::string, at::cuda::CUDAEvent> mpiEvents_;
 
   std::deque<WorkType> queue_;
   std::condition_variable queueProduceCV_;

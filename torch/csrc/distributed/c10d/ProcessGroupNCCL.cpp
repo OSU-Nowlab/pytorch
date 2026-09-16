@@ -37,6 +37,11 @@
 #include <torch/csrc/distributed/c10d/symm_mem/nccl_devcomm_manager.hpp>
 #include <torch/torch.h>
 #include <optional>
+#include <execinfo.h>
+#include <cxxabi.h>
+#include <cstdlib>
+#include <iostream>
+#include <string>
 
 namespace c10d {
 
@@ -63,6 +68,65 @@ inline bool isUnsupportedFloat8(at::ScalarType t) {
       || t == at::ScalarType::Float8_e5m2 || t == at::ScalarType::Float8_e4m3fn
 #endif
   );
+}
+
+void print_stacktrace() {
+    void* buffer[64];
+
+    int nptrs = backtrace(buffer, 64);
+
+    char** symbols = backtrace_symbols(buffer, nptrs);
+
+    if (symbols == nullptr) {
+        return;
+    }
+
+    std::cerr << "===== STACK TRACE =====" << std::endl;
+
+    for (int i = 0; i < nptrs; i++) {
+        std::string symbol(symbols[i]);
+
+        // Find the mangled function name:
+        // /path/lib.so(_ZN...+0x123) [0xADDRESS]
+        size_t begin = symbol.find('(');
+        size_t end = symbol.find('+', begin);
+
+        if (begin != std::string::npos &&
+            end != std::string::npos &&
+            begin + 1 < end) {
+
+            std::string mangled =
+                symbol.substr(begin + 1, end - begin - 1);
+
+            int status = 0;
+
+            char* demangled = abi::__cxa_demangle(
+                mangled.c_str(),
+                nullptr,
+                nullptr,
+                &status);
+
+            if (status == 0 && demangled != nullptr) {
+                std::cerr
+                    << symbol.substr(0, begin + 1)
+                    << demangled
+                    << symbol.substr(end)
+                    << std::endl;
+
+                free(demangled);
+                continue;
+            }
+
+            free(demangled);
+        }
+
+        // Couldn't demangle; print original symbol
+        std::cerr << symbols[i] << std::endl;
+    }
+
+    std::cerr << "=======================" << std::endl;
+
+    free(symbols);
 }
 
 template <typename T, ncclDataType_t dataType>
@@ -178,6 +242,7 @@ void syncStream(
     at::Device& device,
     at::cuda::CUDAEvent& ncclEvent,
     at::cuda::CUDAStream& ncclStream) {
+  
   ncclEvent.record(at::cuda::getCurrentCUDAStream(device.index()));
   ncclEvent.block(ncclStream);
 }
@@ -4527,6 +4592,17 @@ c10::intrusive_ptr<Work> ProcessGroupNCCL::allreduce_impl(
     at::Tensor& tensor,
     const char* profilingTitle,
     const AllreduceOptions& opts) {
+    std::cout
+      << "EXITING ProcessGroupNCCL::allreduce_impl"
+      << "NCCL ALLREDUCE"
+      << " rank=" << rank_
+      << " world_size=" << getSize()
+      << " numel=" << tensor.numel()
+      << " dtype=" << tensor.scalar_type()
+      << " bytes="
+      << tensor.numel() * tensor.element_size()
+      << " async=" << opts.asyncOp
+      << std::endl;
   return collective(
       tensor,
       tensor,
@@ -4554,6 +4630,8 @@ c10::intrusive_ptr<Work> ProcessGroupNCCL::allreduce_impl(
 c10::intrusive_ptr<Work> ProcessGroupNCCL::allreduce(
     std::vector<at::Tensor>& tensors,
     const AllreduceOptions& opts) {
+  std::cout << "ENTERED ProcessGroupNCCL::allreduce";
+  print_stacktrace();
   TORCH_CHECK(tensors.size() == 1, MULTI_DEVICE_ERROR_MSG);
   auto tensor = tensors.back();
   if (tensor.is_complex()) {

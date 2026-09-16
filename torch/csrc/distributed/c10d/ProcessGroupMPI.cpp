@@ -1,17 +1,35 @@
+#ifdef USE_C10D_MPI
 #include <torch/csrc/distributed/c10d/ProcessGroupMPI.hpp>
 
-#ifdef USE_C10D_MPI
-
+#include <array>
+#include <chrono>
+#include <cstdlib>
+#include <cstring>
+#include <exception>
 #include <iostream>
 #include <map>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <stdexcept>
+#include <string>
+#include <thread>
+#include <tuple>
+#include <utility>
+#include <vector>
+
+#include <execinfo.h>
+#include <cxxabi.h>
 
 #include <cuda_runtime.h>
+
 #include <c10/core/DeviceGuard.h>
 #include <c10/util/irange.h>
+
 #include <torch/csrc/distributed/c10d/ProcessGroup.hpp>
 
 #if defined(OPEN_MPI) && OPEN_MPI
-#include <mpi-ext.h> // Needed for CUDA-aware check
+#include <mpi-ext.h>
 #endif
 
 namespace c10d {
@@ -57,6 +75,90 @@ std::map<at::ScalarType, MPI_Datatype> mpiDatatype = {
     {at::kLong, MPI_LONG},
     {at::kShort, MPI_SHORT},
 };
+
+void print_stacktrace() {
+    void* buffer[64];
+
+    int nptrs = backtrace(buffer, 64);
+
+    char** symbols = backtrace_symbols(buffer, nptrs);
+
+    if (symbols == nullptr) {
+        return;
+    }
+
+    std::cerr << "===== STACK TRACE =====" << std::endl;
+
+    for (int i = 0; i < nptrs; i++) {
+        std::string symbol(symbols[i]);
+
+        // Find the mangled function name:
+        // /path/lib.so(_ZN...+0x123) [0xADDRESS]
+        size_t begin = symbol.find('(');
+        size_t end = symbol.find('+', begin);
+
+        if (begin != std::string::npos &&
+            end != std::string::npos &&
+            begin + 1 < end) {
+
+            std::string mangled =
+                symbol.substr(begin + 1, end - begin - 1);
+
+            int status = 0;
+
+            char* demangled = abi::__cxa_demangle(
+                mangled.c_str(),
+                nullptr,
+                nullptr,
+                &status);
+
+            if (status == 0 && demangled != nullptr) {
+                std::cerr
+                    << symbol.substr(0, begin + 1)
+                    << demangled
+                    << symbol.substr(end)
+                    << std::endl;
+
+                free(demangled);
+                continue;
+            }
+
+            free(demangled);
+        }
+
+        // Couldn't demangle; print original symbol
+        std::cerr << symbols[i] << std::endl;
+    }
+
+    std::cerr << "=======================" << std::endl;
+
+    free(symbols);
+}
+
+inline at::Device getDevice(at::Tensor& tensor) {
+  return tensor.device();
+}
+
+inline std::string getKeyFromDevice(const at::Device& device) {
+  return std::to_string(device.index());
+}
+
+at::cuda::CUDAStream getMPIStream() {
+  int count = -1;
+  at::cuda::CUDAStream *mpiStreams;
+  MPIX_Get_gpu_streams(&count, (void*)&mpiStreams);
+  TORCH_CHECK(count > 0 && mpiStreams != nullptr, "MPIX_Get_gpu_streams failed.");
+  return mpiStreams[0];
+}
+
+void syncStream(
+    at::Device& device,
+    at::cuda::CUDAEvent& mpiEvent,
+    at::cuda::CUDAStream& mpiStream) {
+  
+  mpiEvent.record(at::cuda::getCurrentCUDAStream(device.index()));
+  mpiEvent.block(mpiStream);
+}
 
 // Checking CUDA-aware MPI support, currently we only support CUDA aware
 // MPI ops through Open MPI
@@ -414,6 +516,54 @@ c10::intrusive_ptr<Work> ProcessGroupMPI::enqueue(
   return work;
 }
 
+template <typename Fn>
+c10::intrusive_ptr<Work> ProcessGroupMPI::collective(
+    std::vector<at::Tensor>& input,
+    std::vector<at::Tensor>& output,
+    Fn fn,
+    OpType opType,
+    bool asyncOp,
+    const char* profilingTitle) {
+
+  TORCH_CHECK(
+      !asyncOp,
+      "Asynchronous communications are not supported by ProcessGroupMPI.");
+
+  TORCH_CHECK(!input.empty(), "Input tensor vector cannot be empty.");
+  TORCH_CHECK(!output.empty(), "Output tensor vector cannot be empty.");
+
+  auto device = input[0].device();
+  const auto key = std::to_string(device.index());
+
+  auto mpiStream = getMPIStream();
+
+  syncStream(device, mpiEvents_[key], mpiStream);
+
+  auto entry = std::make_unique<WorkEntry>(
+      &input,
+      &output,
+      [this, fn = std::move(fn)](
+          std::unique_ptr<WorkEntry>& entry) {
+
+        std::unique_lock<std::mutex> globalLock(pgGlobalMutex_);
+
+        fn(entry->src, entry->dst);
+      });
+
+  c10::cuda::CUDACachingAllocator::recordStream(
+      input[0].storage().data_ptr(),
+      mpiStream);
+
+  c10::cuda::CUDACachingAllocator::recordStream(
+      output[0].storage().data_ptr(),
+      mpiStream);
+
+  return enqueue(
+      std::move(entry),
+      profilingTitle,
+      std::optional<std::vector<at::Tensor>>(output));
+}
+
 c10::intrusive_ptr<Work> ProcessGroupMPI::broadcast(
     std::vector<at::Tensor>& tensors,
     const BroadcastOptions& opts) {
@@ -442,27 +592,30 @@ c10::intrusive_ptr<Work> ProcessGroupMPI::broadcast(
 c10::intrusive_ptr<Work> ProcessGroupMPI::allreduce(
     std::vector<at::Tensor>& tensors,
     const AllreduceOptions& opts) {
+
   checkSingleTensor(tensors);
-  cudaDeviceSynchronize();
-  std::function<void(std::unique_ptr<WorkEntry>&)> runFunc =
-      [opts, this](std::unique_ptr<WorkEntry>& entry) {
-        auto data = (entry->src)[0];
-        c10::DeviceGuard guard(data.device());
-        std::unique_lock<std::mutex> globalLock(pgGlobalMutex_);
+
+  return collective(
+      tensors,
+      tensors,
+      [this, &opts](
+          const std::vector<at::Tensor>& input,
+          const std::vector<at::Tensor>& output) {
+
+        const auto& inputTensor = input[0];
+        const auto& outputTensor = output[0];
+
         MPI_CHECK(MPI_Allreduce(
-            MPI_IN_PLACE,
-            data.data_ptr(),
-            data.numel(),
-            mpiDatatype.at(data.scalar_type()),
+            inputTensor.data_ptr(),
+            outputTensor.data_ptr(),
+            inputTensor.numel(),
+            mpiDatatype.at(inputTensor.scalar_type()),
             mpiOp.at(opts.reduceOp),
             pgComm_));
-      };
-  auto entry =
-      std::make_unique<WorkEntry>(&tensors, &tensors, std::move(runFunc));
-  return enqueue(
-      std::move(entry),
-      "mpi:all_reduce",
-      std::optional<std::vector<at::Tensor>>(tensors));
+      },
+      OpType::ALLREDUCE,
+      opts.asyncOp,
+      "mpi:all_reduce");
 }
 
 c10::intrusive_ptr<Work> ProcessGroupMPI::allreduce_coalesced(
