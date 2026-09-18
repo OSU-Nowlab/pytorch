@@ -23,7 +23,10 @@
 
 #include <cuda_runtime.h>
 
-#include <c10/core/DeviceGuard.h>
+#include <c10/core/Event.h>
+
+#include <c10/core/Stream.h>
+#include <c10/core/StreamGuard.h>
 #include <c10/util/irange.h>
 
 #include <torch/csrc/distributed/c10d/ProcessGroup.hpp>
@@ -143,20 +146,42 @@ inline std::string getKeyFromDevice(const at::Device& device) {
   return std::to_string(device.index());
 }
 
-at::cuda::CUDAStream getMPIStream() {
-  int count = -1;
-  at::cuda::CUDAStream *mpiStreams;
-  MPIX_Get_gpu_streams(&count, (void*)&mpiStreams);
-  TORCH_CHECK(count > 0 && mpiStreams != nullptr, "MPIX_Get_gpu_streams failed.");
-  return mpiStreams[0];
+c10::Stream getMPIStream(const c10::Device& device) {
+    int count = -1;
+    void* streams = nullptr;
+
+    int ret = MPIX_Get_gpu_streams(&count, &streams);
+
+    TORCH_CHECK(
+        ret == MPI_SUCCESS,
+        "MPIX_Get_gpu_streams failed: ret=", ret);
+
+    TORCH_CHECK(
+        count >= 0 && streams != nullptr,
+        "MPIX_Get_gpu_streams returned invalid streams: "
+        "count=", count,
+        " streams=", streams);
+
+    // Interpret the returned native handle as an integer stream ID.
+    auto stream_id =
+        reinterpret_cast<int64_t*>(
+            static_cast<void*>(streams))[0];
+
+    return c10::Stream(
+        c10::Stream::UNSAFE,
+        c10::Device(device.type(), device.index()),
+        stream_id);
 }
 
 void syncStream(
-    at::Device& device,
-    at::cuda::CUDAEvent& mpiEvent,
-    at::cuda::CUDAStream& mpiStream) {
-  
-  mpiEvent.record(at::cuda::getCurrentCUDAStream(device.index()));
+    c10::Device& device,
+    c10::Event& mpiEvent,
+    c10::Stream& mpiStream) {
+
+  c10::impl::VirtualGuardImpl impl(device.type());
+  c10::Stream currentStream = impl.getStream(device);
+
+  mpiEvent.record(currentStream);
   mpiEvent.block(mpiStream);
 }
 
@@ -524,20 +549,49 @@ c10::intrusive_ptr<Work> ProcessGroupMPI::collective(
     OpType opType,
     bool asyncOp,
     const char* profilingTitle) {
-
+  
   TORCH_CHECK(
-      !asyncOp,
-      "Asynchronous communications are not supported by ProcessGroupMPI.");
+      asyncOp,
+      "Synchronous communications are not supported by ProcessGroupMPI.");
 
   TORCH_CHECK(!input.empty(), "Input tensor vector cannot be empty.");
   TORCH_CHECK(!output.empty(), "Output tensor vector cannot be empty.");
-
+  
   auto device = input[0].device();
+  c10::impl::VirtualGuardImpl impl(device.type());
   const auto key = std::to_string(device.index());
 
-  auto mpiStream = getMPIStream();
+  auto mpiStream = getMPIStream(device);
 
-  syncStream(device, mpiEvents_[key], mpiStream);
+  auto [it, inserted] = mpiEvents_.try_emplace(
+    key,
+    c10::Event(device.type()));
+  
+  std::cerr << "device.type()       = "
+          << c10::DeviceTypeName(device.type())
+          << "\n";
+
+std::cerr << "device.index()      = "
+          << device.index()
+          << "\n";
+
+std::cerr << "mpiStream.device_type() = "
+          << c10::DeviceTypeName(mpiStream.device_type())
+          << "\n";
+
+std::cerr << "mpiStream.device_index() = "
+          << mpiStream.device_index()
+          << "\n";
+
+std::cerr << "event.device_type()  = "
+          << c10::DeviceTypeName(it->second.device_type())
+          << "\n";
+
+std::cerr << "event.device_index() = "
+          << it->second.device_index()
+          << "\n";
+  syncStream(device, it->second, mpiStream);
+  std::cerr << "after stream sync";
 
   auto entry = std::make_unique<WorkEntry>(
       &input,
@@ -550,14 +604,11 @@ c10::intrusive_ptr<Work> ProcessGroupMPI::collective(
         fn(entry->src, entry->dst);
       });
 
-  c10::cuda::CUDACachingAllocator::recordStream(
-      input[0].storage().data_ptr(),
-      mpiStream);
+  impl.recordDataPtrOnStream(input[0].storage().data_ptr(), mpiStream);
+  impl.recordDataPtrOnStream(output[0].storage().data_ptr(), mpiStream);
 
-  c10::cuda::CUDACachingAllocator::recordStream(
-      output[0].storage().data_ptr(),
-      mpiStream);
-
+  std::cerr << "returning from collective";
+  print_stacktrace();
   return enqueue(
       std::move(entry),
       profilingTitle,
@@ -594,7 +645,7 @@ c10::intrusive_ptr<Work> ProcessGroupMPI::allreduce(
     const AllreduceOptions& opts) {
 
   checkSingleTensor(tensors);
-
+  
   return collective(
       tensors,
       tensors,
@@ -604,15 +655,36 @@ c10::intrusive_ptr<Work> ProcessGroupMPI::allreduce(
 
         const auto& inputTensor = input[0];
         const auto& outputTensor = output[0];
+        
+        MPI_Datatype dtype = mpiDatatype.at(inputTensor.scalar_type());
+
+        char mpi_name[MPI_MAX_OBJECT_NAME] = {};
+        int mpi_name_len = 0;
+
+        MPI_Type_get_name(dtype, mpi_name, &mpi_name_len);
+
+        int mpi_size = 0;
+        MPI_Type_size(dtype, &mpi_size);
+
+        std::cerr
+            << "[MPI] dtype debug:"
+            << " torch_dtype=" << inputTensor.scalar_type()
+            << " torch_element_size=" << inputTensor.element_size()
+            << " mpi_datatype=" << dtype
+            << " mpi_name=" << std::string(mpi_name, mpi_name_len)
+            << " mpi_size=" << mpi_size
+            << " numel=" << inputTensor.numel()
+            << std::endl;
 
         MPI_CHECK(MPI_Allreduce(
+            MPI_IN_PLACE,
             inputTensor.data_ptr(),
-            outputTensor.data_ptr(),
             inputTensor.numel(),
             mpiDatatype.at(inputTensor.scalar_type()),
             mpiOp.at(opts.reduceOp),
             pgComm_));
-      },
+        std::err << "after mpi_allreduce";
+          },
       OpType::ALLREDUCE,
       opts.asyncOp,
       "mpi:all_reduce");

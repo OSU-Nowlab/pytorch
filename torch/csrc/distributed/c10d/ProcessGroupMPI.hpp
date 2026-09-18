@@ -27,7 +27,8 @@
 #include <torch/csrc/distributed/c10d/Utils.hpp>
 #include <torch/csrc/distributed/c10d/PrefixStore.hpp>
 #include <torch/csrc/distributed/c10d/Store.hpp>
-//#include <torch/csrc/distributed/c10d/cuda/CUDAEventCache.hpp>
+#include <c10/core/Event.h>
+
 
 #include <c10/core/Stream.h>
 #include <c10/core/StreamGuard.h>
@@ -279,7 +280,7 @@ class TORCH_API ProcessGroupMPI : public Backend {
   std::thread workerThread_;
 
   // The CUDA events used to sync MPI streams
-  std::unordered_map<std::string, at::cuda::CUDAEvent> mpiEvents_;
+  std::unordered_map<std::string, c10::Event> mpiEvents_;
 
   std::deque<WorkType> queue_;
   std::condition_variable queueProduceCV_;
