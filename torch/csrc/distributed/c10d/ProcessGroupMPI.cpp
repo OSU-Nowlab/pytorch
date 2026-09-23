@@ -79,65 +79,6 @@ std::map<at::ScalarType, MPI_Datatype> mpiDatatype = {
     {at::kShort, MPI_SHORT},
 };
 
-void print_stacktrace() {
-    void* buffer[64];
-
-    int nptrs = backtrace(buffer, 64);
-
-    char** symbols = backtrace_symbols(buffer, nptrs);
-
-    if (symbols == nullptr) {
-        return;
-    }
-
-    std::cerr << "===== STACK TRACE =====" << std::endl;
-
-    for (int i = 0; i < nptrs; i++) {
-        std::string symbol(symbols[i]);
-
-        // Find the mangled function name:
-        // /path/lib.so(_ZN...+0x123) [0xADDRESS]
-        size_t begin = symbol.find('(');
-        size_t end = symbol.find('+', begin);
-
-        if (begin != std::string::npos &&
-            end != std::string::npos &&
-            begin + 1 < end) {
-
-            std::string mangled =
-                symbol.substr(begin + 1, end - begin - 1);
-
-            int status = 0;
-
-            char* demangled = abi::__cxa_demangle(
-                mangled.c_str(),
-                nullptr,
-                nullptr,
-                &status);
-
-            if (status == 0 && demangled != nullptr) {
-                std::cerr
-                    << symbol.substr(0, begin + 1)
-                    << demangled
-                    << symbol.substr(end)
-                    << std::endl;
-
-                free(demangled);
-                continue;
-            }
-
-            free(demangled);
-        }
-
-        // Couldn't demangle; print original symbol
-        std::cerr << symbols[i] << std::endl;
-    }
-
-    std::cerr << "=======================" << std::endl;
-
-    free(symbols);
-}
-
 inline at::Device getDevice(at::Tensor& tensor) {
   return tensor.device();
 }
@@ -278,9 +219,6 @@ ProcessGroupMPI::AsyncWork::AsyncWork(
 
 ProcessGroupMPI::AsyncWork::~AsyncWork() {
   if (request_ != MPI_REQUEST_NULL) {
-    std::cerr
-        << "Attempted destruction of AsyncWork before work has completed, "
-        << "terminating the program." << '\n';
     std::terminate();
   }
 }
@@ -377,6 +315,25 @@ std::mutex ProcessGroupMPI::pgGlobalMutex_;
 void ProcessGroupMPI::mpiExit() {
   std::unique_lock<std::mutex> globalLock(pgGlobalMutex_);
   MPI_CHECK(MPI_Finalize());
+}
+
+void ProcessGroupMPI::lazyInitEvents(
+    std::vector<at::Tensor>& tensors,
+    c10::Stream& streams,
+    std::vector<c10::Event>& events) {
+  // Ensure that the tensors in the nested tensor vectors are on the same
+  // device.
+  if (mpiEventsInitialized_) {
+    return;
+  }
+  events.reserve(tensors.size());
+  for (const auto i : c10::irange(tensors.size())) {
+    c10::Device device = tensors[i][0].device();
+    c10::impl::VirtualGuardImpl impl(device.type());
+    events.emplace_back(device.type());
+    events[i].record(impl.getStream(device));
+  }
+  mpiEventsInitialized_ = true;
 }
 
 void ProcessGroupMPI::initMPIOnce() {
@@ -508,9 +465,7 @@ void ProcessGroupMPI::runLoop() {
     }
 
     auto workTuple = std::move(queue_.front());
-
     queue_.pop_front();
-
     auto& workEntry = std::get<0>(workTuple);
     auto& work = std::get<1>(workTuple);
 
@@ -550,65 +505,36 @@ c10::intrusive_ptr<Work> ProcessGroupMPI::collective(
     bool asyncOp,
     const char* profilingTitle) {
   
-  TORCH_CHECK(
-      asyncOp,
-      "Synchronous communications are not supported by ProcessGroupMPI.");
+  //TORCH_CHECK(
+  //    asyncOp,
+  //   "Synchronous communications are not supported by ProcessGroupMPI.");
 
   TORCH_CHECK(!input.empty(), "Input tensor vector cannot be empty.");
   TORCH_CHECK(!output.empty(), "Output tensor vector cannot be empty.");
   
   auto device = input[0].device();
   c10::impl::VirtualGuardImpl impl(device.type());
-  const auto key = std::to_string(device.index());
 
   auto mpiStream = getMPIStream(device);
 
-  auto [it, inserted] = mpiEvents_.try_emplace(
-    key,
-    c10::Event(device.type()));
+  lazyInitEvents(input, mpiStream, mpiEvents_);
   
-  std::cerr << "device.type()       = "
-          << c10::DeviceTypeName(device.type())
-          << "\n";
-
-std::cerr << "device.index()      = "
-          << device.index()
-          << "\n";
-
-std::cerr << "mpiStream.device_type() = "
-          << c10::DeviceTypeName(mpiStream.device_type())
-          << "\n";
-
-std::cerr << "mpiStream.device_index() = "
-          << mpiStream.device_index()
-          << "\n";
-
-std::cerr << "event.device_type()  = "
-          << c10::DeviceTypeName(it->second.device_type())
-          << "\n";
-
-std::cerr << "event.device_index() = "
-          << it->second.device_index()
-          << "\n";
-  syncStream(device, it->second, mpiStream);
-  std::cerr << "after stream sync";
+  syncStream(device, mpiEvents_[device.index()], mpiStream);
 
   auto entry = std::make_unique<WorkEntry>(
       &input,
       &output,
-      [this, fn = std::move(fn)](
-          std::unique_ptr<WorkEntry>& entry) {
+      [this, fn = fn](
+        std::unique_ptr<WorkEntry>& entry) {
 
-        std::unique_lock<std::mutex> globalLock(pgGlobalMutex_);
+          std::unique_lock<std::mutex> globalLock(pgGlobalMutex_);
 
-        fn(entry->src, entry->dst);
+          fn(entry->src, entry->dst);
       });
 
   impl.recordDataPtrOnStream(input[0].storage().data_ptr(), mpiStream);
   impl.recordDataPtrOnStream(output[0].storage().data_ptr(), mpiStream);
 
-  std::cerr << "returning from collective";
-  print_stacktrace();
   return enqueue(
       std::move(entry),
       profilingTitle,
@@ -649,7 +575,7 @@ c10::intrusive_ptr<Work> ProcessGroupMPI::allreduce(
   return collective(
       tensors,
       tensors,
-      [this, &opts](
+      [this, opts](
           const std::vector<at::Tensor>& input,
           const std::vector<at::Tensor>& output) {
 
@@ -666,16 +592,6 @@ c10::intrusive_ptr<Work> ProcessGroupMPI::allreduce(
         int mpi_size = 0;
         MPI_Type_size(dtype, &mpi_size);
 
-        std::cerr
-            << "[MPI] dtype debug:"
-            << " torch_dtype=" << inputTensor.scalar_type()
-            << " torch_element_size=" << inputTensor.element_size()
-            << " mpi_datatype=" << dtype
-            << " mpi_name=" << std::string(mpi_name, mpi_name_len)
-            << " mpi_size=" << mpi_size
-            << " numel=" << inputTensor.numel()
-            << std::endl;
-
         MPI_CHECK(MPI_Allreduce(
             MPI_IN_PLACE,
             inputTensor.data_ptr(),
@@ -683,7 +599,6 @@ c10::intrusive_ptr<Work> ProcessGroupMPI::allreduce(
             mpiDatatype.at(inputTensor.scalar_type()),
             mpiOp.at(opts.reduceOp),
             pgComm_));
-        std::err << "after mpi_allreduce";
           },
       OpType::ALLREDUCE,
       opts.asyncOp,
