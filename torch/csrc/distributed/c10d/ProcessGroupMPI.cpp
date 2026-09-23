@@ -274,6 +274,7 @@ ProcessGroupMPI::AsyncWork::AsyncWork(
       outputTensors_(std::move(outputTensors)),
       request_(request) {
   memset(&status_, 0, sizeof(status_));
+  std::cerr << "creating AsyncWork\n";
 }
 
 ProcessGroupMPI::AsyncWork::~AsyncWork() {
@@ -312,6 +313,7 @@ bool ProcessGroupMPI::AsyncWork::isSuccess() const {
         false,
         "Invalid call to AsyncWork::isSuccess before work has completed");
   }
+  std::cerr << "calling isSuccess()\n";
 
   return status_.MPI_ERROR == MPI_SUCCESS;
 }
@@ -321,6 +323,8 @@ int ProcessGroupMPI::AsyncWork::sourceRank() const {
 }
 
 bool ProcessGroupMPI::AsyncWork::wait(std::chrono::milliseconds /* unused */) {
+ print_stacktrace();
+ std::cerr << "entering AsyncWork::wait\n";    
   if (request_ == MPI_REQUEST_NULL) {
     // AsyncWork needs to manually call profiling end callbacks if they are set,
     // since it does not call ProcessGroup::finish().
@@ -352,6 +356,7 @@ bool ProcessGroupMPI::AsyncWork::wait(std::chrono::milliseconds /* unused */) {
             ProcessGroupMPI::AsyncWork>::unsafe_reclaim_from_nonowning(this));
   }
   // Always return true, because abort API is not implemented.
+  std::cerr << "exiting AsyncWork::wait\n";    
   return true;
 }
 
@@ -359,10 +364,12 @@ void ProcessGroupMPI::AsyncWork::abort(){
     TORCH_CHECK(false, "ProcessGroupMPI::AsyncWork::abort not implemented.")}
 
 std::vector<at::Tensor> ProcessGroupMPI::AsyncWork::result() {
+  std::cerr << "entering AsyncWork::result()\n";
   return outputTensors_;
 }
 
 void ProcessGroupMPI::AsyncWork::populateException() {
+  std::cerr << "entering AsyncWork::populateException()\n";
   std::array<char, MPI_MAX_ERROR_STRING> buf{};
   int len = buf.size();
   MPI_CHECK(MPI_Error_string(status_.MPI_ERROR, buf.data(), &len));
@@ -377,6 +384,25 @@ std::mutex ProcessGroupMPI::pgGlobalMutex_;
 void ProcessGroupMPI::mpiExit() {
   std::unique_lock<std::mutex> globalLock(pgGlobalMutex_);
   MPI_CHECK(MPI_Finalize());
+}
+
+void ProcessGroupMPI::lazyInitEvents(
+    std::vector<at::Tensor>& tensors,
+    c10::Stream& streams,
+    std::vector<c10::Event>& events) {
+  // Ensure that the tensors in the nested tensor vectors are on the same
+  // device.
+  if (mpiEventsInitialized_) {
+    return;
+  }
+  events.reserve(tensors.size());
+  for (const auto i : c10::irange(tensors.size())) {
+    c10::Device device = tensors[i][0].device();
+    c10::impl::VirtualGuardImpl impl(device.type());
+    events.emplace_back(device.type());
+    events[i].record(impl.getStream(device));
+  }
+  mpiEventsInitialized_ = true;
 }
 
 void ProcessGroupMPI::initMPIOnce() {
@@ -499,18 +525,21 @@ void ProcessGroupMPI::abort() {
 }
 
 void ProcessGroupMPI::runLoop() {
+  std::cerr << "entering runLoop\n";    
   std::unique_lock<std::mutex> lock(pgMutex_);
 
   while (!stop_) {
     if (queue_.empty()) {
+      std::cerr << "queue empty\n";    
       queueProduceCV_.wait(lock);
+      std::cerr << "after queue wait\n";
       continue;
     }
 
     auto workTuple = std::move(queue_.front());
-
+    std::cerr << "before pop\n";
     queue_.pop_front();
-
+    std::cerr << "after pop\n";
     auto& workEntry = std::get<0>(workTuple);
     auto& work = std::get<1>(workTuple);
 
@@ -532,12 +561,14 @@ c10::intrusive_ptr<Work> ProcessGroupMPI::enqueue(
     std::unique_ptr<WorkEntry> entry,
     const char* profilingTitle,
     const std::optional<std::vector<at::Tensor>>& inputTensors) {
+  std::cerr << "entering ProcessGroupMPI::enqueue\n";
   auto work =
       c10::make_intrusive<WorkMPI>(entry->dst, profilingTitle, inputTensors);
   std::unique_lock<std::mutex> lock(pgMutex_);
   queue_.emplace_back(std::move(entry), work);
   lock.unlock();
   queueProduceCV_.notify_one();
+  std::cerr << "exiting ProcessGroupMPI::enqueue\n";
   return work;
 }
 
@@ -550,69 +581,44 @@ c10::intrusive_ptr<Work> ProcessGroupMPI::collective(
     bool asyncOp,
     const char* profilingTitle) {
   
-  TORCH_CHECK(
-      asyncOp,
-      "Synchronous communications are not supported by ProcessGroupMPI.");
+  //TORCH_CHECK(
+  //    asyncOp,
+  //   "Synchronous communications are not supported by ProcessGroupMPI.");
 
   TORCH_CHECK(!input.empty(), "Input tensor vector cannot be empty.");
   TORCH_CHECK(!output.empty(), "Output tensor vector cannot be empty.");
   
   auto device = input[0].device();
   c10::impl::VirtualGuardImpl impl(device.type());
-  const auto key = std::to_string(device.index());
 
   auto mpiStream = getMPIStream(device);
 
-  auto [it, inserted] = mpiEvents_.try_emplace(
-    key,
-    c10::Event(device.type()));
+  lazyInitEvents(input, mpiStream, mpiEvents_);
   
-  std::cerr << "device.type()       = "
-          << c10::DeviceTypeName(device.type())
-          << "\n";
-
-std::cerr << "device.index()      = "
-          << device.index()
-          << "\n";
-
-std::cerr << "mpiStream.device_type() = "
-          << c10::DeviceTypeName(mpiStream.device_type())
-          << "\n";
-
-std::cerr << "mpiStream.device_index() = "
-          << mpiStream.device_index()
-          << "\n";
-
-std::cerr << "event.device_type()  = "
-          << c10::DeviceTypeName(it->second.device_type())
-          << "\n";
-
-std::cerr << "event.device_index() = "
-          << it->second.device_index()
-          << "\n";
-  syncStream(device, it->second, mpiStream);
-  std::cerr << "after stream sync";
+  syncStream(device, mpiEvents_[device.index()], mpiStream);
+  std::cerr << "after stream sync\n";
 
   auto entry = std::make_unique<WorkEntry>(
       &input,
       &output,
-      [this, fn = std::move(fn)](
-          std::unique_ptr<WorkEntry>& entry) {
+      [this, fn = fn](
+        std::unique_ptr<WorkEntry>& entry) {
 
-        std::unique_lock<std::mutex> globalLock(pgGlobalMutex_);
+          std::unique_lock<std::mutex> globalLock(pgGlobalMutex_);
 
-        fn(entry->src, entry->dst);
+          fn(entry->src, entry->dst);
       });
 
   impl.recordDataPtrOnStream(input[0].storage().data_ptr(), mpiStream);
   impl.recordDataPtrOnStream(output[0].storage().data_ptr(), mpiStream);
 
-  std::cerr << "returning from collective";
-  print_stacktrace();
-  return enqueue(
+  std::cerr << "enqueueing work\n";
+  auto enqueued = enqueue(
       std::move(entry),
       profilingTitle,
       std::optional<std::vector<at::Tensor>>(output));
+  std::cerr << "after enqueue work, returning from collective()\n";
+  return enqueued;
 }
 
 c10::intrusive_ptr<Work> ProcessGroupMPI::broadcast(
@@ -683,7 +689,7 @@ c10::intrusive_ptr<Work> ProcessGroupMPI::allreduce(
             mpiDatatype.at(inputTensor.scalar_type()),
             mpiOp.at(opts.reduceOp),
             pgComm_));
-        std::err << "after mpi_allreduce";
+        std::cerr << "after mpi_allreduce\n";
           },
       OpType::ALLREDUCE,
       opts.asyncOp,

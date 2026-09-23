@@ -279,8 +279,15 @@ class TORCH_API ProcessGroupMPI : public Backend {
   std::mutex pgMutex_;
   std::thread workerThread_;
 
+  void lazyInitEvents(
+      std::vector<at::Tensor>& tensors,
+      c10::Stream& streams,
+      std::vector<c10::Event>& events);
+
   // The CUDA events used to sync MPI streams
-  std::unordered_map<std::string, c10::Event> mpiEvents_;
+  std::vector<c10::Event> mpiEvents_;
+  bool mpiEventsInitialized_ = false;
+
 
   std::deque<WorkType> queue_;
   std::condition_variable queueProduceCV_;
