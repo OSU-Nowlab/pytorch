@@ -16,6 +16,11 @@
 #include <torch/csrc/distributed/c10d/Backend.hpp>
 #include <torch/csrc/distributed/c10d/Types.hpp>
 #include <torch/csrc/distributed/c10d/Utils.hpp>
+#include <c10/core/Event.h>
+
+
+#include <c10/core/Stream.h>
+#include <c10/core/StreamGuard.h>
 
 #include <mpi.h>
 
@@ -155,8 +160,8 @@ class TORCH_API ProcessGroupMPI : public Backend {
       const BroadcastOptions& opts = BroadcastOptions()) override;
 
   c10::intrusive_ptr<Work> allreduce(
-      std::vector<at::Tensor>& tensors,
-      const AllreduceOptions& opts = AllreduceOptions()) override;
+    std::vector<at::Tensor>& tensors,
+    const AllreduceOptions& opts) override;
 
   c10::intrusive_ptr<Work> allreduce_coalesced(
       std::vector<at::Tensor>& tensors,
@@ -249,10 +254,29 @@ class TORCH_API ProcessGroupMPI : public Backend {
       const std::optional<std::vector<at::Tensor>>& inputTensors =
           std::nullopt);
 
+  template <typename Fn>
+  c10::intrusive_ptr<Work> collective(
+    std::vector<at::Tensor>& input,
+    std::vector<at::Tensor>& output,
+    Fn fn,
+    OpType opType,
+    bool asyncOp,
+    const char* profilingTitle);
+
   bool stop_{false};
 
   std::mutex pgMutex_;
   std::thread workerThread_;
+
+  void lazyInitEvents(
+      std::vector<at::Tensor>& tensors,
+      c10::Stream& streams,
+      std::vector<c10::Event>& events);
+
+  // The CUDA events used to sync MPI streams
+  std::vector<c10::Event> mpiEvents_;
+  bool mpiEventsInitialized_ = false;
+
 
   std::deque<WorkType> queue_;
   std::condition_variable queueProduceCV_;
