@@ -1,18 +1,15 @@
 #ifdef USE_C10D_MPI
 #include <torch/csrc/distributed/c10d/ProcessGroupMPI.hpp>
 
-#include <array>
 #include <cstdlib>
 #include <iostream>
 #include <map>
-#include <memory>
 #include <mutex>
 #include <vector>
 
 #include <cuda_runtime.h>
 
 #include <c10/core/Event.h>
-
 #include <c10/core/Stream.h>
 #include <c10/core/StreamGuard.h>
 #include <c10/util/irange.h>
@@ -445,7 +442,9 @@ void ProcessGroupMPI::runLoop() {
     }
 
     auto workTuple = std::move(queue_.front());
+
     queue_.pop_front();
+    
     auto& workEntry = std::get<0>(workTuple);
     auto& work = std::get<1>(workTuple);
 
