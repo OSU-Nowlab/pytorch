@@ -2,24 +2,12 @@
 #include <torch/csrc/distributed/c10d/ProcessGroupMPI.hpp>
 
 #include <array>
-#include <chrono>
 #include <cstdlib>
-#include <cstring>
-#include <exception>
 #include <iostream>
 #include <map>
 #include <memory>
 #include <mutex>
-#include <optional>
-#include <stdexcept>
-#include <string>
-#include <thread>
-#include <tuple>
-#include <utility>
 #include <vector>
-
-#include <execinfo.h>
-#include <cxxabi.h>
 
 #include <cuda_runtime.h>
 
@@ -78,14 +66,6 @@ std::map<at::ScalarType, MPI_Datatype> mpiDatatype = {
     {at::kLong, MPI_LONG},
     {at::kShort, MPI_SHORT},
 };
-
-inline at::Device getDevice(at::Tensor& tensor) {
-  return tensor.device();
-}
-
-inline std::string getKeyFromDevice(const at::Device& device) {
-  return std::to_string(device.index());
-}
 
 c10::Stream getMPIStream(const c10::Device& device) {
     int count = -1;
@@ -215,7 +195,6 @@ ProcessGroupMPI::AsyncWork::AsyncWork(
       outputTensors_(std::move(outputTensors)),
       request_(request) {
   memset(&status_, 0, sizeof(status_));
-  std::cerr << "creating AsyncWork\n";
 }
 
 ProcessGroupMPI::AsyncWork::~AsyncWork() {
@@ -251,7 +230,6 @@ bool ProcessGroupMPI::AsyncWork::isSuccess() const {
         false,
         "Invalid call to AsyncWork::isSuccess before work has completed");
   }
-  std::cerr << "calling isSuccess()\n";
 
   return status_.MPI_ERROR == MPI_SUCCESS;
 }
@@ -261,8 +239,6 @@ int ProcessGroupMPI::AsyncWork::sourceRank() const {
 }
 
 bool ProcessGroupMPI::AsyncWork::wait(std::chrono::milliseconds /* unused */) {
- print_stacktrace();
- std::cerr << "entering AsyncWork::wait\n";    
   if (request_ == MPI_REQUEST_NULL) {
     // AsyncWork needs to manually call profiling end callbacks if they are set,
     // since it does not call ProcessGroup::finish().
@@ -294,7 +270,6 @@ bool ProcessGroupMPI::AsyncWork::wait(std::chrono::milliseconds /* unused */) {
             ProcessGroupMPI::AsyncWork>::unsafe_reclaim_from_nonowning(this));
   }
   // Always return true, because abort API is not implemented.
-  std::cerr << "exiting AsyncWork::wait\n";    
   return true;
 }
 
@@ -302,12 +277,10 @@ void ProcessGroupMPI::AsyncWork::abort(){
     TORCH_CHECK(false, "ProcessGroupMPI::AsyncWork::abort not implemented.")}
 
 std::vector<at::Tensor> ProcessGroupMPI::AsyncWork::result() {
-  std::cerr << "entering AsyncWork::result()\n";
   return outputTensors_;
 }
 
 void ProcessGroupMPI::AsyncWork::populateException() {
-  std::cerr << "entering AsyncWork::populateException()\n";
   std::array<char, MPI_MAX_ERROR_STRING> buf{};
   int len = buf.size();
   MPI_CHECK(MPI_Error_string(status_.MPI_ERROR, buf.data(), &len));
@@ -463,14 +436,11 @@ void ProcessGroupMPI::abort() {
 }
 
 void ProcessGroupMPI::runLoop() {
-  std::cerr << "entering runLoop\n";    
   std::unique_lock<std::mutex> lock(pgMutex_);
 
   while (!stop_) {
     if (queue_.empty()) {
-      std::cerr << "queue empty\n";    
       queueProduceCV_.wait(lock);
-      std::cerr << "after queue wait\n";
       continue;
     }
 
@@ -497,14 +467,12 @@ c10::intrusive_ptr<Work> ProcessGroupMPI::enqueue(
     std::unique_ptr<WorkEntry> entry,
     const char* profilingTitle,
     const std::optional<std::vector<at::Tensor>>& inputTensors) {
-  std::cerr << "entering ProcessGroupMPI::enqueue\n";
   auto work =
       c10::make_intrusive<WorkMPI>(entry->dst, profilingTitle, inputTensors);
   std::unique_lock<std::mutex> lock(pgMutex_);
   queue_.emplace_back(std::move(entry), work);
   lock.unlock();
   queueProduceCV_.notify_one();
-  std::cerr << "exiting ProcessGroupMPI::enqueue\n";
   return work;
 }
 
@@ -517,9 +485,9 @@ c10::intrusive_ptr<Work> ProcessGroupMPI::collective(
     bool asyncOp,
     const char* profilingTitle) {
   
-  //TORCH_CHECK(
-  //    asyncOp,
-  //   "Synchronous communications are not supported by ProcessGroupMPI.");
+  TORCH_CHECK(
+      asyncOp,
+     "Synchronous communications are not supported by ProcessGroupMPI.");
 
   TORCH_CHECK(!input.empty(), "Input tensor vector cannot be empty.");
   TORCH_CHECK(!output.empty(), "Output tensor vector cannot be empty.");
@@ -581,7 +549,6 @@ c10::intrusive_ptr<Work> ProcessGroupMPI::broadcast(
 c10::intrusive_ptr<Work> ProcessGroupMPI::allreduce(
     std::vector<at::Tensor>& tensors,
     const AllreduceOptions& opts) {
-
   checkSingleTensor(tensors);
   
   return collective(

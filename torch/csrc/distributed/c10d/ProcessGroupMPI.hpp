@@ -2,21 +2,11 @@
 
 #ifdef USE_C10D_MPI
 
-#include <atomic>
-#include <chrono>
 #include <condition_variable>
 #include <deque>
-#include <functional>
-#include <future>
-#include <list>
 #include <memory>
 #include <mutex>
-#include <optional>
-#include <string>
 #include <thread>
-#include <tuple>
-#include <unordered_map>
-#include <utility>
 #include <vector>
 
 #include <ATen/core/ivalue.h>
@@ -25,8 +15,6 @@
 #include <torch/csrc/distributed/c10d/Backend.hpp>
 #include <torch/csrc/distributed/c10d/Types.hpp>
 #include <torch/csrc/distributed/c10d/Utils.hpp>
-#include <torch/csrc/distributed/c10d/PrefixStore.hpp>
-#include <torch/csrc/distributed/c10d/Store.hpp>
 #include <c10/core/Event.h>
 
 

@@ -37,11 +37,6 @@
 #include <torch/csrc/distributed/c10d/symm_mem/nccl_devcomm_manager.hpp>
 #include <torch/torch.h>
 #include <optional>
-#include <execinfo.h>
-#include <cxxabi.h>
-#include <cstdlib>
-#include <iostream>
-#include <string>
 
 namespace c10d {
 
@@ -183,7 +178,6 @@ void syncStream(
     at::Device& device,
     at::cuda::CUDAEvent& ncclEvent,
     at::cuda::CUDAStream& ncclStream) {
-  
   ncclEvent.record(at::cuda::getCurrentCUDAStream(device.index()));
   ncclEvent.block(ncclStream);
 }
