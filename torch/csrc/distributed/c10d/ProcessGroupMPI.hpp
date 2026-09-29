@@ -160,8 +160,8 @@ class TORCH_API ProcessGroupMPI : public Backend {
       const BroadcastOptions& opts = BroadcastOptions()) override;
 
   c10::intrusive_ptr<Work> allreduce(
-    std::vector<at::Tensor>& tensors,
-    const AllreduceOptions& opts) override;
+      std::vector<at::Tensor>& tensors,
+      const AllreduceOptions& opts = AllreduceOptions()) override;
 
   c10::intrusive_ptr<Work> allreduce_coalesced(
       std::vector<at::Tensor>& tensors,
