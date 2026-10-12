@@ -2,11 +2,18 @@
 
 #ifdef USE_C10D_MPI
 
+#include <cstdlib>
 #include <iostream>
 #include <map>
+#include <memory>
+#include <string>
+#include <unordered_map>
+#include <vector>
 
 #include <cuda_runtime.h>
 #include <c10/core/DeviceGuard.h>
+#include <c10/core/Event.h>
+#include <c10/core/impl/VirtualGuardImpl.h>
 #include <c10/util/irange.h>
 #include <torch/csrc/distributed/c10d/ProcessGroup.hpp>
 
@@ -57,6 +64,75 @@ std::map<at::ScalarType, MPI_Datatype> mpiDatatype = {
     {at::kLong, MPI_LONG},
     {at::kShort, MPI_SHORT},
 };
+
+// How a GPU collective is ordered after the caller's work on its current
+// stream. Read once from TORCH_MPI_SYNC_MODE.
+//   event  (default): record an event on the caller's current stream; the
+//                     worker thread waits on it before the MPI call, so only
+//                     the worker blocks.
+//   device: cudaDeviceSynchronize() on the caller before enqueueing.
+enum class MPISyncMode { Event, Device };
+
+MPISyncMode getMPISyncMode() {
+  static const MPISyncMode mode = []() {
+    const char* env = std::getenv("TORCH_MPI_SYNC_MODE");
+    std::string s = env ? env : "event";
+    if (s == "device") {
+      return MPISyncMode::Device;
+    }
+    TORCH_CHECK(
+        s == "event", "TORCH_MPI_SYNC_MODE must be event or device, got: ", s);
+    return MPISyncMode::Event;
+  }();
+  return mode;
+}
+
+class ReadyEventPool {
+ public:
+  static std::shared_ptr<c10::Event> get(c10::Device device) {
+    static auto* pool = new ReadyEventPool();
+    return pool->acquire(device);
+  }
+
+ private:
+  std::shared_ptr<c10::Event> acquire(c10::Device device) {
+    c10::Event* event = nullptr;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      auto& freeList = free_[device];
+      if (!freeList.empty()) {
+        event = freeList.back();
+        freeList.pop_back();
+      }
+    }
+    if (event == nullptr) {
+      event = new c10::Event(device.type());
+    }
+    return std::shared_ptr<c10::Event>(event, [this, device](c10::Event* e) {
+      std::lock_guard<std::mutex> lock(mutex_);
+      free_[device].push_back(e);
+    });
+  }
+
+  std::mutex mutex_;
+  std::unordered_map<c10::Device, std::vector<c10::Event*>> free_;
+};
+
+std::shared_ptr<c10::Event> orderAfterCallerStream(const at::Tensor& tensor) {
+  const auto device = tensor.device();
+  if (device.is_cpu()) {
+    return nullptr;
+  }
+  if (getMPISyncMode() == MPISyncMode::Device) {
+    c10::DeviceGuard guard(device);
+    cudaDeviceSynchronize();
+    return nullptr;
+  }
+  c10::impl::VirtualGuardImpl impl(device.type());
+  auto readyEvent = ReadyEventPool::get(device);
+  readyEvent->record(impl.getStream(device));
+  return readyEvent;
+}
 
 // Checking CUDA-aware MPI support, currently we only support CUDA aware
 // MPI ops through Open MPI
@@ -443,11 +519,14 @@ c10::intrusive_ptr<Work> ProcessGroupMPI::allreduce(
     std::vector<at::Tensor>& tensors,
     const AllreduceOptions& opts) {
   checkSingleTensor(tensors);
-  cudaDeviceSynchronize();
+  auto readyEvent = orderAfterCallerStream(tensors[0]);
   std::function<void(std::unique_ptr<WorkEntry>&)> runFunc =
-      [opts, this](std::unique_ptr<WorkEntry>& entry) {
+      [opts, readyEvent, this](std::unique_ptr<WorkEntry>& entry) {
         auto data = (entry->src)[0];
         c10::DeviceGuard guard(data.device());
+        if (readyEvent) {
+          readyEvent->synchronize();
+        }
         std::unique_lock<std::mutex> globalLock(pgGlobalMutex_);
         MPI_CHECK(MPI_Allreduce(
             MPI_IN_PLACE,
