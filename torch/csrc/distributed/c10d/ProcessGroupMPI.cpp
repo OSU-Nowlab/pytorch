@@ -2,11 +2,18 @@
 
 #ifdef USE_C10D_MPI
 
+#include <cstdlib>
 #include <iostream>
 #include <map>
+#include <memory>
+#include <string>
+#include <unordered_map>
+#include <vector>
 
-#include <cuda_runtime.h>
+#include <ATen/DeviceAccelerator.h>
 #include <c10/core/DeviceGuard.h>
+#include <c10/core/Event.h>
+#include <c10/core/impl/VirtualGuardImpl.h>
 #include <c10/util/irange.h>
 #include <torch/csrc/distributed/c10d/ProcessGroup.hpp>
 
@@ -57,6 +64,58 @@ std::map<at::ScalarType, MPI_Datatype> mpiDatatype = {
     {at::kLong, MPI_LONG},
     {at::kShort, MPI_SHORT},
 };
+
+class ReadyEventPool {
+ public:
+  static std::shared_ptr<c10::Event> get(c10::Device device) {
+    static auto* pool = new ReadyEventPool();
+    return pool->acquire(device);
+  }
+
+ private:
+  std::shared_ptr<c10::Event> acquire(c10::Device device) {
+    c10::Event* event = nullptr;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      auto& freeList = free_[device];
+      if (!freeList.empty()) {
+        event = freeList.back();
+        freeList.pop_back();
+      }
+    }
+    if (event == nullptr) {
+      event = new c10::Event(device.type());
+    }
+    return std::shared_ptr<c10::Event>(event, [this, device](c10::Event* e) {
+      std::lock_guard<std::mutex> lock(mutex_);
+      free_[device].push_back(e);
+    });
+  }
+
+  std::mutex mutex_;
+  std::unordered_map<c10::Device, std::vector<c10::Event*>> free_;
+};
+
+// Orders a GPU op after the caller's work on its current stream
+std::shared_ptr<c10::Event> orderAfterCallerStream(c10::Device device) {
+  if (device.is_cpu()) {
+    return nullptr;
+  }
+  c10::impl::VirtualGuardImpl impl(device.type());
+  auto readyEvent = ReadyEventPool::get(device);
+  readyEvent->record(impl.getStream(device));
+  return readyEvent;
+}
+
+// copy_ on a GPU only queues the copy on this thread's current stream. Wait for
+// it before MPI reads a flat buffer.
+void waitForWorkerCopies(const c10::Device& device) {
+  if (device.is_cpu()) {
+    return;
+  }
+  c10::impl::VirtualGuardImpl impl(device.type());
+  impl.getStream(device).synchronize();
+}
 
 // Checking CUDA-aware MPI support, currently we only support CUDA aware
 // MPI ops through Open MPI
@@ -418,9 +477,12 @@ c10::intrusive_ptr<Work> ProcessGroupMPI::broadcast(
     std::vector<at::Tensor>& tensors,
     const BroadcastOptions& opts) {
   checkSingleTensor(tensors);
-  cudaDeviceSynchronize();
+  auto readyEvent = orderAfterCallerStream(tensors[0].device());
   std::function<void(std::unique_ptr<WorkEntry>&)> runFunc =
-      [opts, this](std::unique_ptr<WorkEntry>& entry) {
+      [opts, readyEvent, this](std::unique_ptr<WorkEntry>& entry) {
+        if (readyEvent) {
+          readyEvent->synchronize();
+        }
         auto data = (entry->src)[0];
         c10::DeviceGuard guard(data.device());
         std::unique_lock<std::mutex> globalLock(pgGlobalMutex_);
@@ -443,11 +505,14 @@ c10::intrusive_ptr<Work> ProcessGroupMPI::allreduce(
     std::vector<at::Tensor>& tensors,
     const AllreduceOptions& opts) {
   checkSingleTensor(tensors);
-  cudaDeviceSynchronize();
+  auto readyEvent = orderAfterCallerStream(tensors[0].device());
   std::function<void(std::unique_ptr<WorkEntry>&)> runFunc =
-      [opts, this](std::unique_ptr<WorkEntry>& entry) {
+      [opts, readyEvent, this](std::unique_ptr<WorkEntry>& entry) {
         auto data = (entry->src)[0];
         c10::DeviceGuard guard(data.device());
+        if (readyEvent) {
+          readyEvent->synchronize();
+        }
         std::unique_lock<std::mutex> globalLock(pgGlobalMutex_);
         MPI_CHECK(MPI_Allreduce(
             MPI_IN_PLACE,
@@ -475,9 +540,12 @@ c10::intrusive_ptr<Work> ProcessGroupMPI::reduce(
     std::vector<at::Tensor>& tensors,
     const ReduceOptions& opts) {
   checkSingleTensor(tensors);
-  cudaDeviceSynchronize();
+  auto readyEvent = orderAfterCallerStream(tensors[0].device());
   std::function<void(std::unique_ptr<WorkEntry>&)> runFunc =
-      [opts, this](std::unique_ptr<WorkEntry>& entry) {
+      [opts, readyEvent, this](std::unique_ptr<WorkEntry>& entry) {
+        if (readyEvent) {
+          readyEvent->synchronize();
+        }
         auto data = (entry->src)[0];
         auto dataPtr = (entry->src)[0].data_ptr();
         void* sendbuf = (rank_ == opts.rootRank) ? MPI_IN_PLACE : dataPtr;
@@ -507,7 +575,7 @@ c10::intrusive_ptr<Work> ProcessGroupMPI::allgather(
     std::vector<at::Tensor>& inputTensors,
     const AllgatherOptions& opts) {
   checkSingleTensor(inputTensors);
-  cudaDeviceSynchronize();
+  auto readyEvent = orderAfterCallerStream(inputTensors[0].device());
   if (outputTensors.size() != 1) {
     TORCH_CHECK(
         false,
@@ -524,7 +592,10 @@ c10::intrusive_ptr<Work> ProcessGroupMPI::allgather(
   checkSameSizeAndType(inputTensors[0], outputTensors[0]);
 
   std::function<void(std::unique_ptr<WorkEntry>&)> runFunc =
-      [this](std::unique_ptr<WorkEntry>& entry) {
+      [readyEvent, this](std::unique_ptr<WorkEntry>& entry) {
+        if (readyEvent) {
+          readyEvent->synchronize();
+        }
         auto data = (entry->src)[0];
         std::vector<at::Tensor> outputDataVec = entry->dst;
         auto flatOutputTensor = newLikeFlat(outputDataVec);
@@ -543,6 +614,7 @@ c10::intrusive_ptr<Work> ProcessGroupMPI::allgather(
         for (const auto i : c10::irange(outputDataVec.size())) {
           outputDataVec[i].copy_(flatOutputTensor[static_cast<int64_t>(i)]);
         }
+        waitForWorkerCopies(data.device());
       };
   auto entry = std::make_unique<WorkEntry>(
       &inputTensors, &outputTensors[0], std::move(runFunc));
@@ -564,7 +636,7 @@ c10::intrusive_ptr<Work> ProcessGroupMPI::gather(
     std::vector<at::Tensor>& inputTensors,
     const GatherOptions& opts) {
   checkSingleTensor(inputTensors);
-  cudaDeviceSynchronize();
+  auto readyEvent = orderAfterCallerStream(inputTensors[0].device());
   if (rank_ != opts.rootRank) {
     if (!outputTensors.empty()) {
       TORCH_CHECK(
@@ -586,7 +658,10 @@ c10::intrusive_ptr<Work> ProcessGroupMPI::gather(
   }
 
   std::function<void(std::unique_ptr<WorkEntry>&)> runFunc =
-      [opts, this](std::unique_ptr<WorkEntry>& entry) {
+      [opts, readyEvent, this](std::unique_ptr<WorkEntry>& entry) {
+        if (readyEvent) {
+          readyEvent->synchronize();
+        }
         auto data = (entry->src)[0];
         void* recvbuf = nullptr;
         at::Tensor flatOutputTensor;
@@ -616,6 +691,7 @@ c10::intrusive_ptr<Work> ProcessGroupMPI::gather(
             outputDataVec.at(i).copy_(
                 flatOutputTensor[static_cast<int64_t>(i)]);
           }
+          waitForWorkerCopies(data.device());
         }
       };
 
@@ -641,7 +717,7 @@ c10::intrusive_ptr<Work> ProcessGroupMPI::scatter(
     std::vector<std::vector<at::Tensor>>& inputTensors,
     const ScatterOptions& opts) {
   checkSingleTensor(outputTensors);
-  cudaDeviceSynchronize();
+  auto readyEvent = orderAfterCallerStream(outputTensors[0].device());
   if (rank_ != opts.rootRank) {
     if (!inputTensors.empty()) {
       TORCH_CHECK(
@@ -663,7 +739,10 @@ c10::intrusive_ptr<Work> ProcessGroupMPI::scatter(
   }
 
   std::function<void(std::unique_ptr<WorkEntry>&)> runFunc =
-      [opts, this](std::unique_ptr<WorkEntry>& entry) {
+      [opts, readyEvent, this](std::unique_ptr<WorkEntry>& entry) {
+        if (readyEvent) {
+          readyEvent->synchronize();
+        }
         auto data = (entry->dst)[0];
         void* sendbuf = nullptr;
         at::Tensor flatInputTensor;
@@ -677,6 +756,7 @@ c10::intrusive_ptr<Work> ProcessGroupMPI::scatter(
           for (const auto i : c10::irange(inputDataVec.size())) {
             flatInputTensor[static_cast<int64_t>(i)].copy_(inputDataVec.at(i));
           }
+          waitForWorkerCopies(data.device());
         }
 
         c10::DeviceGuard guard(data.device());
@@ -718,7 +798,7 @@ c10::intrusive_ptr<Work> ProcessGroupMPI::reduce_scatter(
     std::vector<std::vector<at::Tensor>>& inputTensors,
     const ReduceScatterOptions& opts) {
   checkSingleTensor(outputTensors);
-  cudaDeviceSynchronize();
+  auto readyEvent = orderAfterCallerStream(outputTensors[0].device());
   if (inputTensors.size() != 1) {
     TORCH_CHECK(
         false,
@@ -734,12 +814,16 @@ c10::intrusive_ptr<Work> ProcessGroupMPI::reduce_scatter(
   checkSameSizeAndType(outputTensors[0], inputTensors[0]);
 
   std::function<void(std::unique_ptr<WorkEntry>&)> runFunc =
-      [opts, this](std::unique_ptr<WorkEntry>& entry) {
+      [opts, readyEvent, this](std::unique_ptr<WorkEntry>& entry) {
+        if (readyEvent) {
+          readyEvent->synchronize();
+        }
         auto data = (entry->dst)[0];
         auto flatInputTensor = newLikeFlat(entry->src);
         for (const auto i : c10::irange(entry->src.size())) {
           flatInputTensor[static_cast<int64_t>(i)].copy_(entry->src[i]);
         }
+        waitForWorkerCopies(data.device());
         int recvcount = flatInputTensor.numel() / size_;
 
         c10::DeviceGuard guard(data.device());
@@ -769,7 +853,7 @@ c10::intrusive_ptr<Work> ProcessGroupMPI::all_to_all_single(
     const AllToAllOptions& opts) {
   checkSingleTensorHelper(inputTensor);
   checkSingleTensorHelper(outputTensor);
-  cudaDeviceSynchronize();
+  auto readyEvent = orderAfterCallerStream(inputTensor.device());
   if (outputSplitSizes.empty() && inputSplitSizes.empty()) {
     // We can use alltoall
     TORCH_CHECK(
@@ -781,7 +865,10 @@ c10::intrusive_ptr<Work> ProcessGroupMPI::all_to_all_single(
         "Tensor's dim 0 does not divide equally across group size");
 
     std::function<void(std::unique_ptr<WorkEntry>&)> runFunc =
-        [this](std::unique_ptr<WorkEntry>& entry) {
+        [readyEvent, this](std::unique_ptr<WorkEntry>& entry) {
+          if (readyEvent) {
+            readyEvent->synchronize();
+          }
           auto srcdata = (entry->src)[0];
           auto dstdata = (entry->dst)[0];
           c10::DeviceGuard guard(srcdata.device());
@@ -808,8 +895,11 @@ c10::intrusive_ptr<Work> ProcessGroupMPI::all_to_all_single(
     c10d::checkSplitSizes(inputSplitSizes, inputTensor, size_);
     c10d::checkSplitSizes(outputSplitSizes, outputTensor, size_);
     std::function<void(std::unique_ptr<WorkEntry>&)> runFunc =
-        [this, inputSplitSizes, outputSplitSizes](
+        [this, readyEvent, inputSplitSizes, outputSplitSizes](
             std::unique_ptr<WorkEntry>& entry) {
+          if (readyEvent) {
+            readyEvent->synchronize();
+          }
           auto srcdata = (entry->src)[0];
           auto dstdata = (entry->dst)[0];
           std::vector<int> send_lengths(size_);
@@ -848,15 +938,18 @@ c10::intrusive_ptr<Work> ProcessGroupMPI::alltoall(
     std::vector<at::Tensor>& outputTensors,
     std::vector<at::Tensor>& inputTensors,
     const AllToAllOptions& opts) {
-  cudaDeviceSynchronize();
   TORCH_CHECK(
       inputTensors.size() == static_cast<size_t>(size_),
       "Number of input tensors are not equal to group size");
   TORCH_CHECK(
       outputTensors.size() == static_cast<size_t>(size_),
       "Number of output tensors are not equal to group size");
+  auto readyEvent = orderAfterCallerStream(inputTensors[0].device());
   std::function<void(std::unique_ptr<WorkEntry>&)> runFunc =
-      [this](std::unique_ptr<WorkEntry>& entry) {
+      [readyEvent, this](std::unique_ptr<WorkEntry>& entry) {
+        if (readyEvent) {
+          readyEvent->synchronize();
+        }
         std::vector<int> send_lengths(size_);
         std::vector<int> recv_lengths(size_);
         std::vector<int> send_offsets(size_);
@@ -880,6 +973,7 @@ c10::intrusive_ptr<Work> ProcessGroupMPI::alltoall(
         for (const auto i : c10::irange(size_)) {
           srcFlatDataSplits[i].copy_(srcdata[i].view({-1}));
         }
+        waitForWorkerCopies(srcdata[0].device());
         c10::DeviceGuard guard1(srcdata[0].device());
         std::unique_lock<std::mutex> globalLock(pgGlobalMutex_);
         MPI_CHECK(MPI_Alltoallv(
@@ -898,6 +992,7 @@ c10::intrusive_ptr<Work> ProcessGroupMPI::alltoall(
         for (const auto i : c10::irange(size_)) {
           dstdata[i].view({-1}).copy_(dstFlatDataSplits[i]);
         }
+        waitForWorkerCopies(dstdata[0].device());
       };
   auto entry = std::make_unique<WorkEntry>(
       &inputTensors, &outputTensors, std::move(runFunc));
@@ -912,8 +1007,10 @@ c10::intrusive_ptr<Work> ProcessGroupMPI::send(
     int dstRank,
     int tag) {
   checkSingleTensor(tensors);
-  cudaDeviceSynchronize();
   auto& tensor = tensors[0];
+  if (auto readyEvent = orderAfterCallerStream(tensor.device())) {
+    readyEvent->synchronize();
+  }
   MPI_Request request = MPI_REQUEST_NULL;
 
   {
@@ -941,8 +1038,10 @@ c10::intrusive_ptr<Work> ProcessGroupMPI::recv(
     int srcRank,
     int tag) {
   checkSingleTensor(tensors);
-  cudaDeviceSynchronize();
   auto& tensor = tensors[0];
+  if (auto readyEvent = orderAfterCallerStream(tensor.device())) {
+    readyEvent->synchronize();
+  }
   MPI_Request request = MPI_REQUEST_NULL;
 
   {
@@ -969,8 +1068,10 @@ c10::intrusive_ptr<Work> ProcessGroupMPI::recvAnysource(
     std::vector<at::Tensor>& tensors,
     int tag) {
   checkSingleTensor(tensors);
-  cudaDeviceSynchronize();
   auto& tensor = tensors[0];
+  if (auto readyEvent = orderAfterCallerStream(tensor.device())) {
+    readyEvent->synchronize();
+  }
   MPI_Request request = MPI_REQUEST_NULL;
 
   {
@@ -994,7 +1095,9 @@ c10::intrusive_ptr<Work> ProcessGroupMPI::recvAnysource(
 }
 
 c10::intrusive_ptr<Work> ProcessGroupMPI::barrier(const BarrierOptions& opts) {
-  cudaDeviceSynchronize();
+  if (at::accelerator::deviceCount() > 0) {
+    at::accelerator::getCurrentStream(at::accelerator::getDeviceIndex()).synchronize();
+  }
   std::function<void(std::unique_ptr<WorkEntry>&)> runFunc =
       [this](std::unique_ptr<WorkEntry>& entry) {
         std::unique_lock<std::mutex> globalLock(pgGlobalMutex_);
@@ -1009,13 +1112,16 @@ c10::intrusive_ptr<Work> ProcessGroupMPI::all_gather_single(
     at::Tensor& outputTensor,
     at::Tensor& inputTensor,
     const AllgatherOptions& opts) {
-  cudaDeviceSynchronize();
   TORCH_CHECK(
       outputTensor.numel() == inputTensor.numel() * size_,
       "All gather: output tensor size must be equal to input tensor size times the world size");
+  auto readyEvent = orderAfterCallerStream(inputTensor.device());
 
   std::function<void(std::unique_ptr<WorkEntry>&)> runFunc =
-      [this](std::unique_ptr<WorkEntry>& entry) {
+      [readyEvent, this](std::unique_ptr<WorkEntry>& entry) {
+        if (readyEvent) {
+          readyEvent->synchronize();
+        }
         auto dstdata = (entry->dst)[0];
         auto srcdata = (entry->src)[0];
         c10::DeviceGuard guard(srcdata.device());
@@ -1044,13 +1150,16 @@ c10::intrusive_ptr<Work> ProcessGroupMPI::reduce_scatter_single(
     at::Tensor& outputTensor,
     at::Tensor& inputTensor,
     const ReduceScatterOptions& opts) {
-  cudaDeviceSynchronize();
   TORCH_CHECK(
       outputTensor.numel() * size_ == inputTensor.numel(),
       "Reduce scatter: input tensor size must be equal to output tensor size times the world size");
+  auto readyEvent = orderAfterCallerStream(inputTensor.device());
 
   std::function<void(std::unique_ptr<WorkEntry>&)> runFunc =
-      [opts, this](std::unique_ptr<WorkEntry>& entry) {
+      [opts, readyEvent, this](std::unique_ptr<WorkEntry>& entry) {
+        if (readyEvent) {
+          readyEvent->synchronize();
+        }
         auto dstdata = (entry->dst)[0];
         auto srcdata = (entry->src)[0];
         c10::DeviceGuard guard(srcdata.device());
